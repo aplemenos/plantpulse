@@ -8,3 +8,4 @@ mlartifacts/
 .DS_Store
 /data/*
 !/data/.gitkeep
+!/data/*.dvc
