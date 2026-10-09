@@ -1,0 +1,26 @@
+{
+  "rows_scored": 69120,
+  "cpu_cores_available": 2,
+  "naive_serial": {
+    "rows_per_sec": 94.1,
+    "projected_full_run_sec": 734.25
+  },
+  "vectorized_single_core": {
+    "seconds": 0.81,
+    "rows_per_sec": 85351.1,
+    "speedup_vs_naive": 906.7
+  },
+  "process_pool": {
+    "1": {
+      "seconds": 1.042,
+      "rows_per_sec": 66310.3,
+      "speedup_vs_vectorized": 0.78
+    },
+    "2": {
+      "seconds": 0.708,
+      "rows_per_sec": 97567.3,
+      "speedup_vs_vectorized": 1.14
+    }
+  },
+  "results_identical_across_methods": true
+}
