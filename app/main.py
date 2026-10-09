@@ -11,7 +11,11 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 
+from pathlib import Path
+
+import pandas as pd
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
 
 from app.inference import NotEnoughData, batch_predict_anomaly, predict_anomaly, predict_forecast, search_logs
@@ -38,6 +42,14 @@ def get_state() -> AppState:
     if _state is None:
         raise HTTPException(503, "service still starting up")
     return _state
+
+
+INDEX_HTML = Path(__file__).resolve().parent / "static" / "index.html"
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(INDEX_HTML)
 
 
 @app.get("/health")
@@ -89,14 +101,28 @@ def cache_stats():
     return get_state().cache.stats()
 
 
+@app.get("/sites/{site_id}/top-flagged")
+def top_flagged(site_id: str):
+    moment = get_state().top_flagged_moment(site_id)
+    if moment is None:
+        raise HTTPException(404, f"no data for site_id={site_id!r}")
+    return moment
+
+
 @app.get("/stream/telemetry/{site_id}")
-async def stream_telemetry(site_id: str, speed: float = 20.0, tail: int = 200):
-    """Server-Sent Events: replays the tail of a site's telemetry at an
-    accelerated rate (`speed`x real time), running the anomaly model live
-    on each event as it's emitted - the real-time inference path.
+async def stream_telemetry(site_id: str, speed: float = 20.0, tail: int = 200, start: str | None = None):
+    """Server-Sent Events: replays a site's telemetry at an accelerated rate
+    (`speed`x real time), running the anomaly model live on each event as
+    it's emitted - the real-time inference path. Replays the last `tail`
+    readings, or `tail` readings from `start` if given.
     """
     state = get_state()
-    site_df = state.df[state.df["site_id"] == site_id].tail(tail).reset_index(drop=True)
+    site_all = state.site_frame(site_id)
+    if start is not None:
+        site_all = site_all[site_all["timestamp"] >= pd.Timestamp(start)]
+        site_df = site_all.head(tail).reset_index(drop=True)
+    else:
+        site_df = site_all.tail(tail).reset_index(drop=True)
     if site_df.empty:
         raise HTTPException(404, f"no data for site_id={site_id!r}")
 

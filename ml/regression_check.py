@@ -150,7 +150,15 @@ def compare(current: dict, baseline: dict) -> list[str]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--update-baseline", action="store_true")
+    parser.add_argument(
+        "--latency-tolerance", type=float, default=None,
+        help="Override allowed relative p95 latency increase (e.g. 2.0 = 3x) for "
+             "runners whose hardware differs from where the baseline was recorded. "
+             "Quality and routing gates are never loosened.",
+    )
     args = parser.parse_args(argv)
+    if args.latency_tolerance is not None:
+        TOLERANCES["latency_p95_ms"] = args.latency_tolerance
 
     state = AppState()
     contract = check_data_contract(state)

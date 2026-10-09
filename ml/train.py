@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,8 @@ MLFLOW_DIR = ROOT / "mlruns"
 
 
 def _git_commit() -> str:
+    if os.environ.get("GIT_COMMIT"):  # set by CI / Docker build, where .git isn't present
+        return os.environ["GIT_COMMIT"]
     try:
         return subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, text=True

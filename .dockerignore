@@ -1,0 +1,13 @@
+.venv
+.git
+.dvc/cache
+.dvc/tmp
+.pytest_cache
+__pycache__
+**/__pycache__
+data
+mlruns
+ml/artifacts
+ml/regression_history.jsonl
+tests
+notebooks

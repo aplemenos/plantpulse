@@ -1,3 +1,4 @@
+# Runtime + training (what the Docker image needs)
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 sse-starlette==2.2.1
@@ -7,12 +8,7 @@ numpy==1.26.4
 scikit-learn==1.5.2
 joblib==1.4.2
 mlflow==2.19.0
-fastembed==0.5.1
 faiss-cpu==1.9.0.post1
 httpx==0.28.1
-pytest==8.3.4
-pytest-asyncio==0.25.0
-python-multipart==0.0.20
-dvc
 anthropic==0.42.0
-
+redis==5.2.1

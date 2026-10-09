@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest==8.3.4
+pytest-asyncio==0.25.0
+dvc==3.67.1
+# Optional neural embedder (ml/vector_store.py FastEmbedEmbedder); needs huggingface.co access
+fastembed==0.5.1

@@ -18,6 +18,7 @@ import pandas as pd
 from app.cache import build_cache
 from app.registry import ModelRegistry
 from ml.features import (
+    ANOMALY_FEATURES,
     EXPECTED_POWER_FEATURES,
     add_anomaly_features,
     add_expected_power_features,
@@ -42,6 +43,12 @@ class AppState:
         self.df = df.sort_values(["site_id", "timestamp"]).reset_index(drop=True)
 
         self.vector_store = VectorStore.load()
+
+        # One vectorized scoring pass at startup, used only for "where did the
+        # model flag something" highlights in the UI - never for live answers.
+        self.df["model_anomaly_proba"] = self.registry.anomaly_detector.model.predict_proba(
+            self.df[ANOMALY_FEATURES]
+        )[:, 1]
 
         self.sites = (
             self.df[["site_id", "site_type", "capacity_kw"]]
@@ -68,3 +75,13 @@ class AppState:
             return frame
         cutoff = np.searchsorted(self._site_ts[site_id], np.datetime64(pd.Timestamp(as_of)), side="right")
         return frame.iloc[:cutoff]
+
+    def top_flagged_moment(self, site_id: str) -> dict | None:
+        frame = self._site_frames.get(site_id)
+        if frame is None:
+            return None
+        # exclude known curtailment: the model already treats it as benign
+        candidates = frame[frame["is_curtailed"] == 0]
+        row = candidates.loc[candidates["model_anomaly_proba"].idxmax()]
+        return {"site_id": site_id, "timestamp": str(row["timestamp"]),
+                "anomaly_probability": round(float(row["model_anomaly_proba"]), 4)}

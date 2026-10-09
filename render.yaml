@@ -1,0 +1,11 @@
+# Render Blueprint (alternative to Hugging Face Spaces). Free plan has 512 MB RAM;
+# the service peaks around ~330 MB, so it fits, but HF Spaces' free tier has more headroom.
+services:
+  - type: web
+    name: plantpulse
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false   # optional: set in the Render dashboard to enable LLM tool-use mode

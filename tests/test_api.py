@@ -74,3 +74,21 @@ def test_stream_emits_scored_events(client):
         text = "".join(chunk for chunk in r.iter_text())
     assert text.count("event: telemetry") == 3
     assert "anomaly_probability" in text
+
+
+def test_top_flagged_points_at_a_high_probability_moment(client):
+    body = client.get("/sites/wind-02/top-flagged").json()
+    assert body["anomaly_probability"] > 0.5
+
+
+def test_stream_can_replay_from_a_start_time(client):
+    url = "/stream/telemetry/solar-01?speed=100000&tail=2&start=2026-03-10T11:30:00"
+    with client.stream("GET", url) as r:
+        text = "".join(r.iter_text())
+    assert '"timestamp": "2026-03-10 11:30:00"' in text
+
+
+def test_index_page_is_served(client):
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "PlantPulse" in r.text
