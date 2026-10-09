@@ -1,0 +1,171 @@
+"""
+Agent orchestration: turns a natural-language analytics question into
+tool calls against the ML serving layer, then a synthesized answer.
+
+Two modes, same underlying tools (agent/tools.py):
+
+  - LLM mode (real agentic tool-use): used when ANTHROPIC_API_KEY is set.
+    Calls Claude's Messages API with the tool specs and lets the model
+    decide what to call and how to compose the answer. This is the
+    genuinely agentic path, and the one worth describing as "the" design
+    in an interview - but it needs a real API key to run, which this
+    sandbox was not given, so it is implemented but not exercised by the
+    test suite here.
+
+  - Rule-based mode (fallback, default, no credentials needed): a small
+    keyword/entity planner that still calls the *same* tool functions,
+    so the service and its tests are fully runnable with zero external
+    dependencies. This is the mode exercised below and in CI.
+
+Both paths return the same response shape: {"answer": str, "tool_calls": [...]}.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+
+from app.state import AppState
+from agent.tools import TOOL_SPECS, dispatch
+
+_SITE_ID_RE = re.compile(r"\b((?:solar|wind)-0?\d+)\b", re.IGNORECASE)
+
+
+def _extract_site_ids(question: str, known_sites: list[str]) -> list[str]:
+    found = {m.group(1).lower() for m in _SITE_ID_RE.finditer(question)}
+    # normalize "wind-2" -> "wind-02" to match generated ids
+    normalized = set()
+    for site_id in found:
+        kind, num = site_id.split("-")
+        normalized.add(f"{kind}-{int(num):02d}")
+    matched = [s for s in known_sites if s in normalized]
+    return matched
+
+
+def _extract_intents(question: str) -> list[str]:
+    q = question.lower()
+    intents = []
+    if any(w in q for w in ("anomal", "wrong", "issue", "problem", "fault", "fail", "drop")):
+        intents.append("check_anomaly")
+    if any(w in q for w in ("forecast", "predict", "expect", "next hour", "going to be")):
+        intents.append("forecast_power")
+    if any(w in q for w in ("seen this before", "similar", "history", "log", "maintenance", "past incident")):
+        intents.append("search_maintenance_logs")
+    if not intents:
+        intents.append("check_anomaly")  # sensible default for an analytics question
+    return intents
+
+
+def _rule_based_answer(state: AppState, question: str) -> dict:
+    known_sites = [s["site_id"] for s in state.sites]
+    site_ids = _extract_site_ids(question, known_sites)
+    intents = _extract_intents(question)
+
+    tool_calls = []
+    parts = []
+
+    if not site_ids:
+        return {
+            "answer": (
+                "I couldn't tell which site you mean - try naming one explicitly, "
+                f"e.g. {known_sites[0]} (known sites: {', '.join(known_sites)})."
+            ),
+            "tool_calls": [],
+            "mode": "rule_based",
+        }
+
+    for site_id in site_ids:
+        if "check_anomaly" in intents:
+            result = dispatch(state, "check_anomaly", {"site_id": site_id})
+            tool_calls.append({"tool": "check_anomaly", "input": {"site_id": site_id}, "output": result})
+            if "error" in result:
+                parts.append(f"{site_id}: {result['error']}")
+            elif result["is_curtailed"]:
+                parts.append(
+                    f"{site_id} is producing {result['actual_power_kw']} kW against an expected "
+                    f"{result['expected_power_kw']} kW, but it's under a known curtailment order, "
+                    "so the deviation is intentional, not a fault."
+                )
+            elif result["is_anomaly"]:
+                parts.append(
+                    f"{site_id} looks anomalous (probability {result['anomaly_probability']}): "
+                    f"{result['actual_power_kw']} kW actual vs {result['expected_power_kw']} kW expected "
+                    f"({result['residual_pct']*100:.1f}% residual)."
+                )
+            else:
+                parts.append(
+                    f"{site_id} looks healthy: {result['actual_power_kw']} kW actual vs "
+                    f"{result['expected_power_kw']} kW expected."
+                )
+
+        if "forecast_power" in intents:
+            result = dispatch(state, "forecast_power", {"site_id": site_id})
+            tool_calls.append({"tool": "forecast_power", "input": {"site_id": site_id}, "output": result})
+            if "error" in result:
+                parts.append(f"{site_id} forecast: {result['error']}")
+            else:
+                parts.append(
+                    f"{site_id} is forecast at {result['forecast_power_kw']} kW in the next hour "
+                    f"(currently {result['current_power_kw']} kW)."
+                )
+
+        if "search_maintenance_logs" in intents:
+            query = question
+            result = dispatch(state, "search_maintenance_logs", {"query": query, "k": 2})
+            tool_calls.append({"tool": "search_maintenance_logs", "input": {"query": query}, "output": result})
+            hits = result.get("results", [])
+            if hits:
+                examples = "; ".join(f"[{h['site_id']}, {h['date']}] {h['text']}" for h in hits)
+                parts.append(f"Similar past incidents: {examples}")
+
+    return {"answer": " ".join(parts), "tool_calls": tool_calls, "mode": "rule_based"}
+
+
+def _llm_answer(state: AppState, question: str, api_key: str) -> dict:
+    """Real agentic tool-use via Anthropic's Messages API. Requires network
+    access to api.anthropic.com and a valid key - not exercised in this
+    sandbox's test suite, but this is the path to describe as the design
+    in an interview: the model, not keyword matching, decides what to call.
+    """
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+    messages = [{"role": "user", "content": question}]
+    tool_calls = []
+
+    for _ in range(4):  # bounded agent loop
+        response = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            tools=TOOL_SPECS,
+            messages=messages,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+
+        tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_use_blocks:
+            final_text = "".join(b.text for b in response.content if b.type == "text")
+            return {"answer": final_text, "tool_calls": tool_calls, "mode": "llm"}
+
+        tool_results = []
+        for block in tool_use_blocks:
+            result = dispatch(state, block.name, block.input)
+            tool_calls.append({"tool": block.name, "input": block.input, "output": result})
+            tool_results.append(
+                {"type": "tool_result", "tool_use_id": block.id, "content": str(result)}
+            )
+        messages.append({"role": "user", "content": tool_results})
+
+    return {"answer": "(agent loop exceeded max turns without a final answer)", "tool_calls": tool_calls, "mode": "llm"}
+
+
+def answer_question(state: AppState, question: str) -> dict:
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        try:
+            return _llm_answer(state, question, api_key)
+        except Exception as exc:  # fall back rather than hard-fail the request
+            fallback = _rule_based_answer(state, question)
+            fallback["llm_error"] = str(exc)
+            return fallback
+    return _rule_based_answer(state, question)
