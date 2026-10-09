@@ -9,3 +9,4 @@ mlartifacts/
 /data/*
 !/data/.gitkeep
 !/data/*.dvc
+ml/regression_history.jsonl
