@@ -27,7 +27,7 @@ def predict_anomaly(state: AppState, site_id: str, as_of: str | None = None) -> 
     row = site_df.iloc[-1]
 
     proba = float(
-        state.registry.anomaly_detector.model.predict_proba(row[ANOMALY_FEATURES].to_frame().T)[0, 1]
+        state.registry.anomaly_detector.model.predict_proba(site_df[ANOMALY_FEATURES].iloc[[-1]])[0, 1]
     )
     result = {
         "site_id": site_id,
@@ -55,7 +55,7 @@ def predict_forecast(state: AppState, site_id: str, as_of: str | None = None) ->
     if site_df.empty:
         raise NotEnoughData(f"no telemetry for site_id={site_id!r} as_of={as_of!r}")
     row = site_df.iloc[-1]
-    feat_row = row[FORECAST_FEATURES].to_frame().T
+    feat_row = site_df[FORECAST_FEATURES].iloc[[-1]]
     if feat_row.isna().any(axis=None):
         raise NotEnoughData(
             f"not enough history yet for site_id={site_id!r} as_of={as_of!r} "

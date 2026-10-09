@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from app.cache import build_cache
@@ -49,8 +50,21 @@ class AppState:
             .to_dict(orient="records")
         )
 
+        # Per-site index (sorted by time) so a lookup is a dict hit + binary
+        # search instead of a boolean scan over every row in the fleet.
+        self._site_frames = {
+            site_id: frame.reset_index(drop=True)
+            for site_id, frame in self.df.groupby("site_id", sort=False)
+        }
+        self._site_ts = {
+            site_id: frame["timestamp"].to_numpy() for site_id, frame in self._site_frames.items()
+        }
+
     def site_frame(self, site_id: str, as_of: str | None = None) -> pd.DataFrame:
-        site_df = self.df[self.df["site_id"] == site_id]
-        if as_of is not None:
-            site_df = site_df[site_df["timestamp"] <= pd.Timestamp(as_of)]
-        return site_df
+        frame = self._site_frames.get(site_id)
+        if frame is None:
+            return self.df.iloc[0:0]
+        if as_of is None:
+            return frame
+        cutoff = np.searchsorted(self._site_ts[site_id], np.datetime64(pd.Timestamp(as_of)), side="right")
+        return frame.iloc[:cutoff]

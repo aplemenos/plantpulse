@@ -104,11 +104,10 @@ async def stream_telemetry(site_id: str, speed: float = 20.0, tail: int = 200):
     sleep_s = max(real_interval_s / speed, 0.05)
 
     async def event_generator():
-        for _, row in site_df.iterrows():
+        features = site_df[ANOMALY_FEATURES]
+        for i, row in site_df.iterrows():
             proba = float(
-                state.registry.anomaly_detector.model.predict_proba(
-                    row[ANOMALY_FEATURES].to_frame().T
-                )[0, 1]
+                state.registry.anomaly_detector.model.predict_proba(features.iloc[[i]])[0, 1]
             )
             payload = {
                 "site_id": site_id,

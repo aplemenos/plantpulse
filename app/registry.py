@@ -36,6 +36,10 @@ def load_current(model_name: str) -> LoadedModel:
     version_dir = ROOT / pointer["path"]
 
     model = joblib.load(version_dir / "model.joblib")
+    # Online inference scores one row at a time; fanning a single row out across
+    # threads (n_jobs=-1, the training setting) costs far more than it saves.
+    if "n_jobs" in model.get_params():
+        model.set_params(n_jobs=1)
     metadata = json.loads((version_dir / "metadata.json").read_text())
     return LoadedModel(model_name, model, metadata)
 

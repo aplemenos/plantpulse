@@ -29,6 +29,10 @@ from app.state import AppState
 from agent.tools import TOOL_SPECS, dispatch
 
 _SITE_ID_RE = re.compile(r"\b((?:solar|wind)-0?\d+)\b", re.IGNORECASE)
+_HISTORY_RE = re.compile(
+    r"\bseen\b.*\bbefore\b|\bsimilar\b|\bhistory\b|\blogs?\b|\bmaintenance\b|\bpast incidents?\b|\bhappened before\b",
+    re.IGNORECASE,
+)
 
 
 def _extract_site_ids(question: str, known_sites: list[str]) -> list[str]:
@@ -49,7 +53,7 @@ def _extract_intents(question: str) -> list[str]:
         intents.append("check_anomaly")
     if any(w in q for w in ("forecast", "predict", "expect", "next hour", "going to be")):
         intents.append("forecast_power")
-    if any(w in q for w in ("seen this before", "similar", "history", "log", "maintenance", "past incident")):
+    if _HISTORY_RE.search(q):
         intents.append("search_maintenance_logs")
     if not intents:
         intents.append("check_anomaly")  # sensible default for an analytics question
