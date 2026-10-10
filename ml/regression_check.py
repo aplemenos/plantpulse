@@ -25,14 +25,15 @@ import argparse
 import json
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import f1_score, mean_absolute_error, precision_score, recall_score
 
-from agent.orchestrator import _extract_intents, _extract_site_ids
+from agent.orchestrator import extract_intents, extract_site_ids
 from app.inference import predict_anomaly
 from app.state import AppState
 from ml.features import ANOMALY_FEATURES, EXPECTED_POWER_FEATURES, FORECAST_FEATURES
@@ -43,7 +44,7 @@ BASELINE_PATH = ROOT / "ml" / "regression_baseline.json"
 HISTORY_PATH = ROOT / "ml" / "regression_history.jsonl"
 
 # Allowed slack before a change counts as a regression.
-TOLERANCES = {
+TOLERANCES: dict[str, float] = {
     "anomaly_f1": -0.02,           # may drop at most 0.02 absolute
     "anomaly_recall": -0.03,
     "anomaly_precision": -0.03,
@@ -53,7 +54,7 @@ TOLERANCES = {
     "agent_routing_accuracy": 0.0,  # must not drop at all
 }
 
-GOLDEN_AGENT_QUERIES = [
+GOLDEN_AGENT_QUERIES: list[tuple[str, list[str], list[str]]] = [
     ("is anything wrong with wind-02?", ["wind-02"], ["check_anomaly"]),
     ("what's the forecast for solar-01 next hour", ["solar-01"], ["forecast_power"]),
     ("have we seen this vibration before on wind-3", ["wind-03"], ["search_maintenance_logs"]),
@@ -68,18 +69,18 @@ EXPECTED_COLUMNS = {
 }
 
 
-def check_data_contract(state: AppState) -> dict:
+def check_data_contract(state: AppState) -> dict[str, Any]:
     raw_cols = set(pd.read_csv(ROOT / "data" / "telemetry.csv", nrows=1).columns)
     df = state.df
     return {
         "missing_columns": sorted(EXPECTED_COLUMNS - raw_cols),
-        "row_count": int(len(df)),
+        "row_count": len(df),
         "power_null_rate": float(df["power_kw"].isna().mean()),
         "negative_power_rows": int((df["power_kw"] < 0).sum()),
     }
 
 
-def eval_quality(state: AppState) -> dict:
+def eval_quality(state: AppState) -> dict[str, float]:
     df = state.df
     _, test = time_split(df)
 
@@ -101,7 +102,7 @@ def eval_quality(state: AppState) -> dict:
     }
 
 
-def eval_latency(state: AppState, n: int = 200) -> dict:
+def eval_latency(state: AppState, n: int = 200) -> dict[str, float]:
     rng = np.random.default_rng(0)
     sample = state.df.iloc[rng.choice(len(state.df), size=n, replace=False)]
     timings_ms = []
@@ -115,12 +116,12 @@ def eval_latency(state: AppState, n: int = 200) -> dict:
     }
 
 
-def eval_agent_routing(state: AppState) -> dict:
+def eval_agent_routing(state: AppState) -> dict[str, Any]:
     known = [s["site_id"] for s in state.sites]
     correct, failures = 0, []
     for question, want_sites, want_tools in GOLDEN_AGENT_QUERIES:
-        got_sites = _extract_site_ids(question, known)
-        got_tools = _extract_intents(question)
+        got_sites = extract_site_ids(question, known)
+        got_tools = extract_intents(question)
         if sorted(got_sites) == sorted(want_sites) and sorted(got_tools) == sorted(want_tools):
             correct += 1
         else:
@@ -131,13 +132,13 @@ def eval_agent_routing(state: AppState) -> dict:
     }
 
 
-def compare(current: dict, baseline: dict) -> list[str]:
+def compare(current: dict[str, Any], baseline: dict[str, float]) -> list[str]:
     problems = []
     for key, tol in TOLERANCES.items():
         if key not in baseline:
             continue
         cur, base = current[key], baseline[key]
-        lower_is_better = key.endswith("_kw") or key.endswith("_ms")
+        lower_is_better = key.endswith(("_kw", "_ms"))
         if lower_is_better:
             if cur > base * (1 + tol):
                 problems.append(f"{key}: {cur} vs baseline {base} (allowed +{tol:.0%})")
@@ -147,7 +148,7 @@ def compare(current: dict, baseline: dict) -> list[str]:
     return problems
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--update-baseline", action="store_true")
     parser.add_argument(
@@ -169,7 +170,7 @@ def main(argv=None) -> int:
     }
 
     record = {
-        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "ran_at": datetime.now(UTC).isoformat(),
         "model_versions": state.registry.versions(),
         "metrics": current,
         "data_contract": contract,

@@ -38,6 +38,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
+from typing_extensions import TypedDict  # pydantic needs this on Python < 3.12
 
 RNG_SEED = 42
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -46,6 +48,23 @@ FREQ_MINUTES = 15
 DAYS = 120
 STEPS_PER_DAY = (24 * 60) // FREQ_MINUTES
 
+FloatArray = NDArray[np.float64]
+
+
+class Event(TypedDict):
+    site_id: str
+    event_type: str
+    start: pd.Timestamp
+    end: pd.Timestamp
+
+
+class MaintenanceLog(TypedDict):
+    log_id: str
+    site_id: str
+    event_type: str
+    date: str
+    text: str
+
 
 @dataclass
 class Site:
@@ -53,10 +72,10 @@ class Site:
     site_type: str  # "solar" | "wind"
     capacity_kw: float
     seasonal_phase_days: float = 0.0
-    rng: np.random.Generator = field(default=None, repr=False)
+    rng: np.random.Generator = field(default_factory=lambda: np.random.default_rng(RNG_SEED), repr=False)
 
 
-def _solar_irradiance(t_days: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+def _solar_irradiance(t_days: FloatArray, rng: np.random.Generator) -> FloatArray:
     """W/m^2 irradiance: diurnal sine clipped at 0, seasonal amplitude swing, cloud noise."""
     hour_of_day = (t_days % 1.0) * 24
     diurnal = np.clip(np.sin((hour_of_day - 6) / 12 * np.pi), 0, None)
@@ -69,7 +88,7 @@ def _solar_irradiance(t_days: np.ndarray, rng: np.random.Generator) -> np.ndarra
     return np.clip(irr, 0, None)
 
 
-def _wind_speed(t_days: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+def _wind_speed(t_days: FloatArray, rng: np.random.Generator) -> FloatArray:
     """m/s wind speed via a mean-reverting (Ornstein-Uhlenbeck) process with diurnal lift."""
     n = len(t_days)
     speed = np.zeros(n)
@@ -77,7 +96,7 @@ def _wind_speed(t_days: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     theta, sigma = 0.08, 0.6
     speed[0] = mean_speed
     for i in range(1, n):
-        diurnal_lift = 0.6 * math.sin((t_days[i] % 1.0) * 2 * math.pi)
+        diurnal_lift = 0.6 * math.sin((float(t_days[i]) % 1.0) * 2 * math.pi)
         speed[i] = (
             speed[i - 1]
             + theta * (mean_speed + diurnal_lift - speed[i - 1])
@@ -86,13 +105,13 @@ def _wind_speed(t_days: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return np.clip(speed, 0, None)
 
 
-def _solar_power(irradiance: np.ndarray, ambient_temp: np.ndarray, capacity_kw: float) -> np.ndarray:
+def _solar_power(irradiance: FloatArray, ambient_temp: FloatArray, capacity_kw: float) -> FloatArray:
     """Simple PV model: linear in irradiance, derated above 25C by ~0.4%/C."""
     derate = 1 - 0.004 * np.clip(ambient_temp - 25, 0, None)
     return capacity_kw * (irradiance / 1000.0) * derate
 
 
-def _wind_power(wind_speed: np.ndarray, capacity_kw: float) -> np.ndarray:
+def _wind_power(wind_speed: FloatArray, capacity_kw: float) -> FloatArray:
     """Cubic power curve with cut-in (3 m/s), rated (12 m/s), cut-out (25 m/s)."""
     cut_in, rated, cut_out = 3.0, 12.0, 25.0
     power = np.zeros_like(wind_speed)
@@ -103,7 +122,7 @@ def _wind_power(wind_speed: np.ndarray, capacity_kw: float) -> np.ndarray:
     return power
 
 
-def _ambient_temp(t_days: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+def _ambient_temp(t_days: FloatArray, rng: np.random.Generator) -> FloatArray:
     hour_of_day = (t_days % 1.0) * 24
     seasonal = 18 + 10 * np.sin(2 * np.pi * (t_days / 365.0 - 0.2))
     diurnal = 6 * np.sin((hour_of_day - 9) / 24 * 2 * np.pi)
@@ -111,10 +130,10 @@ def _ambient_temp(t_days: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return seasonal + diurnal + noise
 
 
-def _inject_events(df: pd.DataFrame, site: Site, rng: np.random.Generator) -> list[dict]:
+def _inject_events(df: pd.DataFrame, site: Site, rng: np.random.Generator) -> list[Event]:
     """Mutate df in place with anomaly/curtailment windows; return event metadata."""
     n = len(df)
-    events = []
+    events: list[Event] = []
     n_events = rng.integers(4, 8)
     event_types = (
         ["inverter_fault", "sensor_drift", "curtailment"]
@@ -123,7 +142,7 @@ def _inject_events(df: pd.DataFrame, site: Site, rng: np.random.Generator) -> li
     )
 
     for _ in range(n_events):
-        etype = rng.choice(event_types)
+        etype = str(rng.choice(event_types))
         start_idx = int(rng.integers(STEPS_PER_DAY * 2, n - STEPS_PER_DAY * 6))
         duration_steps = int(rng.integers(STEPS_PER_DAY // 2, STEPS_PER_DAY * 3))
         end_idx = min(start_idx + duration_steps, n - 1)
@@ -136,18 +155,18 @@ def _inject_events(df: pd.DataFrame, site: Site, rng: np.random.Generator) -> li
         elif etype == "sensor_drift":
             drift_col = "ambient_temp_c" if rng.random() < 0.5 else "irradiance_wm2" if site.site_type == "solar" else "wind_speed_ms"
             ramp = np.linspace(0, rng.uniform(4, 9), end_idx - start_idx)
-            df.loc[df.index[sl], drift_col] = df.loc[df.index[sl], drift_col].values + ramp
+            df.loc[df.index[sl], drift_col] = df.loc[df.index[sl], drift_col].to_numpy(dtype=np.float64) + ramp
             df.loc[df.index[sl], "is_anomaly"] = 1
         elif etype == "curtailment":
             cap_fraction = rng.uniform(0.3, 0.6)
             df.loc[df.index[sl], "power_kw"] = np.minimum(
-                df.loc[df.index[sl], "power_kw"].values, site.capacity_kw * cap_fraction
+                df.loc[df.index[sl], "power_kw"].to_numpy(dtype=np.float64), site.capacity_kw * cap_fraction
             )
             df.loc[df.index[sl], "is_curtailed"] = 1
             # curtailment is NOT labeled an anomaly - it's intentional
         elif etype == "mechanical_wear":
             ramp = np.linspace(0, rng.uniform(3, 6), end_idx - start_idx)
-            df.loc[df.index[sl], "vibration_mm_s"] = df.loc[df.index[sl], "vibration_mm_s"].values + ramp
+            df.loc[df.index[sl], "vibration_mm_s"] = df.loc[df.index[sl], "vibration_mm_s"].to_numpy(dtype=np.float64) + ramp
             df.loc[df.index[sl], "power_kw"] *= np.linspace(1.0, 0.85, end_idx - start_idx)
             df.loc[df.index[sl], "is_anomaly"] = 1
 
@@ -155,16 +174,16 @@ def _inject_events(df: pd.DataFrame, site: Site, rng: np.random.Generator) -> li
             {
                 "site_id": site.site_id,
                 "event_type": etype,
-                "start": df.iloc[start_idx]["timestamp"],
-                "end": df.iloc[end_idx]["timestamp"],
+                "start": pd.Timestamp(df["timestamp"].iloc[start_idx]),
+                "end": pd.Timestamp(df["timestamp"].iloc[end_idx]),
             }
         )
     return events
 
 
-def generate_site_telemetry(site: Site) -> tuple[pd.DataFrame, list[dict]]:
+def generate_site_telemetry(site: Site) -> tuple[pd.DataFrame, list[Event]]:
     n = DAYS * STEPS_PER_DAY
-    t_days = np.arange(n) / STEPS_PER_DAY + site.seasonal_phase_days
+    t_days = np.arange(n, dtype=np.float64) / STEPS_PER_DAY + site.seasonal_phase_days
     timestamps = pd.date_range("2026-01-01", periods=n, freq=f"{FREQ_MINUTES}min")
 
     ambient_temp = _ambient_temp(t_days, site.rng)
@@ -228,8 +247,8 @@ MAINTENANCE_TEMPLATES = {
 }
 
 
-def build_maintenance_logs(all_events: list[dict], rng: np.random.Generator) -> list[dict]:
-    logs = []
+def build_maintenance_logs(all_events: list[Event], rng: np.random.Generator) -> list[MaintenanceLog]:
+    logs: list[MaintenanceLog] = []
     for i, ev in enumerate(all_events):
         templates = MAINTENANCE_TEMPLATES[ev["event_type"]]
         template = templates[int(rng.integers(0, len(templates)))]
@@ -239,27 +258,32 @@ def build_maintenance_logs(all_events: list[dict], rng: np.random.Generator) -> 
                 "log_id": f"log-{i:04d}",
                 "site_id": ev["site_id"],
                 "event_type": ev["event_type"],
-                "date": str(pd.Timestamp(ev["end"]).date()),
-                "text": f"{pd.Timestamp(ev['end']).date()} — Site {ev['site_id']}: {text}",
+                "date": str(ev["end"].date()),
+                "text": f"{ev['end'].date()} — Site {ev['site_id']}: {text}",
             }
         )
     return logs
 
 
-def main():
+def _child_rng(master: np.random.Generator) -> np.random.Generator:
+    return np.random.default_rng(int(master.integers(1_000_000_000)))
+
+
+def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     master_rng = np.random.default_rng(RNG_SEED)
 
     sites = [
-        Site("solar-01", "solar", 2500, rng=np.random.default_rng(master_rng.integers(1e9))),
-        Site("solar-02", "solar", 1800, seasonal_phase_days=40, rng=np.random.default_rng(master_rng.integers(1e9))),
-        Site("solar-03", "solar", 3200, seasonal_phase_days=10, rng=np.random.default_rng(master_rng.integers(1e9))),
-        Site("wind-01", "wind", 2000, rng=np.random.default_rng(master_rng.integers(1e9))),
-        Site("wind-02", "wind", 2600, seasonal_phase_days=25, rng=np.random.default_rng(master_rng.integers(1e9))),
-        Site("wind-03", "wind", 1500, seasonal_phase_days=60, rng=np.random.default_rng(master_rng.integers(1e9))),
+        Site("solar-01", "solar", 2500, rng=_child_rng(master_rng)),
+        Site("solar-02", "solar", 1800, seasonal_phase_days=40, rng=_child_rng(master_rng)),
+        Site("solar-03", "solar", 3200, seasonal_phase_days=10, rng=_child_rng(master_rng)),
+        Site("wind-01", "wind", 2000, rng=_child_rng(master_rng)),
+        Site("wind-02", "wind", 2600, seasonal_phase_days=25, rng=_child_rng(master_rng)),
+        Site("wind-03", "wind", 1500, seasonal_phase_days=60, rng=_child_rng(master_rng)),
     ]
 
-    all_frames, all_events = [], []
+    all_frames: list[pd.DataFrame] = []
+    all_events: list[Event] = []
     for site in sites:
         df, events = generate_site_telemetry(site)
         all_frames.append(df)

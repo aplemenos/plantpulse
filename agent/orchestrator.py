@@ -24,9 +24,12 @@ from __future__ import annotations
 
 import os
 import re
+from typing import Any, cast
 
-from app.state import AppState
 from agent.tools import TOOL_SPECS, dispatch
+from app.state import AppState
+
+AgentAnswer = dict[str, Any]
 
 _SITE_ID_RE = re.compile(r"\b((?:solar|wind)-0?\d+)\b", re.IGNORECASE)
 _HISTORY_RE = re.compile(
@@ -35,10 +38,10 @@ _HISTORY_RE = re.compile(
 )
 
 
-def _extract_site_ids(question: str, known_sites: list[str]) -> list[str]:
+def extract_site_ids(question: str, known_sites: list[str]) -> list[str]:
     found = {m.group(1).lower() for m in _SITE_ID_RE.finditer(question)}
     # normalize "wind-2" -> "wind-02" to match generated ids
-    normalized = set()
+    normalized: set[str] = set()
     for site_id in found:
         kind, num = site_id.split("-")
         normalized.add(f"{kind}-{int(num):02d}")
@@ -46,9 +49,9 @@ def _extract_site_ids(question: str, known_sites: list[str]) -> list[str]:
     return matched
 
 
-def _extract_intents(question: str) -> list[str]:
+def extract_intents(question: str) -> list[str]:
     q = question.lower()
-    intents = []
+    intents: list[str] = []
     if any(w in q for w in ("anomal", "wrong", "issue", "problem", "fault", "fail", "drop")):
         intents.append("check_anomaly")
     if any(w in q for w in ("forecast", "predict", "expect", "next hour", "going to be")):
@@ -60,13 +63,13 @@ def _extract_intents(question: str) -> list[str]:
     return intents
 
 
-def _rule_based_answer(state: AppState, question: str) -> dict:
+def _rule_based_answer(state: AppState, question: str) -> AgentAnswer:
     known_sites = [s["site_id"] for s in state.sites]
-    site_ids = _extract_site_ids(question, known_sites)
-    intents = _extract_intents(question)
+    site_ids = extract_site_ids(question, known_sites)
+    intents = extract_intents(question)
 
-    tool_calls = []
-    parts = []
+    tool_calls: list[dict[str, Any]] = []
+    parts: list[str] = []
 
     if not site_ids:
         return {
@@ -117,7 +120,7 @@ def _rule_based_answer(state: AppState, question: str) -> dict:
             query = question
             result = dispatch(state, "search_maintenance_logs", {"query": query, "k": 2})
             tool_calls.append({"tool": "search_maintenance_logs", "input": {"query": query}, "output": result})
-            hits = result.get("results", [])
+            hits = cast(list[dict[str, Any]], result.get("results", []))
             if hits:
                 examples = "; ".join(f"[{h['site_id']}, {h['date']}] {h['text']}" for h in hits)
                 parts.append(f"Similar past incidents: {examples}")
@@ -125,17 +128,23 @@ def _rule_based_answer(state: AppState, question: str) -> dict:
     return {"answer": " ".join(parts), "tool_calls": tool_calls, "mode": "rule_based"}
 
 
-def _llm_answer(state: AppState, question: str, api_key: str) -> dict:
+def _llm_answer(state: AppState, question: str, api_key: str) -> AgentAnswer:
     """Real agentic tool-use via Anthropic's Messages API. Requires network
     access to api.anthropic.com and a valid key - not exercised in this
     sandbox's test suite, but this is the path to describe as the design
     in an interview: the model, not keyword matching, decides what to call.
     """
     import anthropic
+    from anthropic.types import (
+        MessageParam,
+        TextBlock,
+        ToolResultBlockParam,
+        ToolUseBlock,
+    )
 
     client = anthropic.Anthropic(api_key=api_key)
-    messages = [{"role": "user", "content": question}]
-    tool_calls = []
+    messages: list[MessageParam] = [{"role": "user", "content": question}]
+    tool_calls: list[dict[str, Any]] = []
 
     for _ in range(4):  # bounded agent loop
         response = client.messages.create(
@@ -146,15 +155,16 @@ def _llm_answer(state: AppState, question: str, api_key: str) -> dict:
         )
         messages.append({"role": "assistant", "content": response.content})
 
-        tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+        tool_use_blocks = [b for b in response.content if isinstance(b, ToolUseBlock)]
         if not tool_use_blocks:
-            final_text = "".join(b.text for b in response.content if b.type == "text")
+            final_text = "".join(b.text for b in response.content if isinstance(b, TextBlock))
             return {"answer": final_text, "tool_calls": tool_calls, "mode": "llm"}
 
-        tool_results = []
+        tool_results: list[ToolResultBlockParam] = []
         for block in tool_use_blocks:
-            result = dispatch(state, block.name, block.input)
-            tool_calls.append({"tool": block.name, "input": block.input, "output": result})
+            tool_input = cast(dict[str, Any], block.input)  # validated by the tool's input_schema
+            result = dispatch(state, block.name, tool_input)
+            tool_calls.append({"tool": block.name, "input": tool_input, "output": result})
             tool_results.append(
                 {"type": "tool_result", "tool_use_id": block.id, "content": str(result)}
             )
@@ -163,12 +173,14 @@ def _llm_answer(state: AppState, question: str, api_key: str) -> dict:
     return {"answer": "(agent loop exceeded max turns without a final answer)", "tool_calls": tool_calls, "mode": "llm"}
 
 
-def answer_question(state: AppState, question: str) -> dict:
+def answer_question(state: AppState, question: str) -> AgentAnswer:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if api_key:
+        import anthropic
+
         try:
             return _llm_answer(state, question, api_key)
-        except Exception as exc:  # fall back rather than hard-fail the request
+        except anthropic.APIError as exc:  # network, auth, rate-limit or server errors
             fallback = _rule_based_answer(state, question)
             fallback["llm_error"] = str(exc)
             return fallback

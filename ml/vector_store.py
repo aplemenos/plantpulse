@@ -20,23 +20,32 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 import faiss
 import joblib
 import numpy as np
+from numpy.typing import NDArray
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.pipeline import make_pipeline
+from sklearn.pipeline import Pipeline, make_pipeline
+
+from ml.data_generation import MaintenanceLog
 
 ROOT = Path(__file__).resolve().parent.parent
 LOGS_PATH = ROOT / "data" / "maintenance_logs.json"
 STORE_DIR = ROOT / "ml" / "artifacts" / "vector_store"
 EMBED_DIM = 128
 
+Vectors = NDArray[np.float32]
+
+
+class SearchHit(MaintenanceLog):
+    score: float
+
 
 class Embedder(Protocol):
-    def embed(self, texts: list[str]) -> np.ndarray: ...
+    def embed(self, texts: list[str]) -> Vectors: ...
 
 
 class TfidfSvdEmbedder:
@@ -47,11 +56,11 @@ class TfidfSvdEmbedder:
     retrieval pipeline rather than state-of-the-art semantic recall.
     """
 
-    def __init__(self, n_components: int = EMBED_DIM):
+    def __init__(self, n_components: int = EMBED_DIM) -> None:
         self.n_components = n_components
-        self._pipeline = None
+        self._pipeline: Pipeline | None = None
 
-    def fit(self, texts: list[str]) -> "TfidfSvdEmbedder":
+    def fit(self, texts: list[str]) -> TfidfSvdEmbedder:
         n_components = min(self.n_components, max(2, len(texts) - 1))
         self._pipeline = make_pipeline(
             TfidfVectorizer(ngram_range=(1, 2), min_df=1, stop_words="english"),
@@ -60,16 +69,18 @@ class TfidfSvdEmbedder:
         self._pipeline.fit(texts)
         return self
 
-    def embed(self, texts: list[str]) -> np.ndarray:
-        return self._pipeline.transform(texts).astype("float32")
+    def embed(self, texts: list[str]) -> Vectors:
+        if self._pipeline is None:
+            raise RuntimeError("TfidfSvdEmbedder must be fitted or loaded before embedding")
+        return self._pipeline.transform(texts).astype(np.float32)
 
-    def save(self, path: Path):
+    def save(self, path: Path) -> None:
         joblib.dump(self._pipeline, path)
 
     @classmethod
-    def load(cls, path: Path) -> "TfidfSvdEmbedder":
+    def load(cls, path: Path) -> TfidfSvdEmbedder:
         inst = cls()
-        inst._pipeline = joblib.load(path)
+        inst._pipeline = cast(Pipeline, joblib.load(path))
         return inst
 
 
@@ -83,25 +94,26 @@ class FastEmbedEmbedder:
 
     MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
-    def __init__(self):
-        from fastembed import TextEmbedding  # imported lazily - optional dependency path
+    def __init__(self) -> None:
+        from fastembed import (
+            TextEmbedding,  # imported lazily - optional dependency path
+        )
 
         self._model = TextEmbedding(model_name=self.MODEL_NAME)
 
-    def embed(self, texts: list[str]) -> np.ndarray:
-        return np.array(list(self._model.embed(texts))).astype("float32")
+    def embed(self, texts: list[str]) -> Vectors:
+        return np.array(list(self._model.embed(texts)), dtype=np.float32)
 
 
 class VectorStore:
-    def __init__(self, index: faiss.Index, records: list[dict], embedder: Embedder):
+    def __init__(self, index: faiss.Index, records: list[MaintenanceLog], embedder: Embedder) -> None:
         self._index = index
         self._records = records
         self._embedder = embedder
 
     @classmethod
-    def build(cls, embedder: Embedder | None = None) -> "VectorStore":
-        with open(LOGS_PATH) as f:
-            records = json.load(f)
+    def build(cls, embedder: Embedder | None = None) -> VectorStore:
+        records = _read_records(LOGS_PATH)
         texts = [r["text"] for r in records]
 
         embedder = embedder or TfidfSvdEmbedder().fit(texts)
@@ -128,25 +140,37 @@ class VectorStore:
         return cls(index, records, embedder)
 
     @classmethod
-    def load(cls) -> "VectorStore":
+    def load(cls) -> VectorStore:
         index = faiss.read_index(str(STORE_DIR / "index.faiss"))
-        with open(STORE_DIR / "records.json") as f:
-            records = json.load(f)
+        records = _read_records(STORE_DIR / "records.json")
         embedder = TfidfSvdEmbedder.load(STORE_DIR / "embedder.joblib")
         return cls(index, records, embedder)
 
-    def search(self, query: str, k: int = 3) -> list[dict]:
+    def search(self, query: str, k: int = 3) -> list[SearchHit]:
         qvec = self._embedder.embed([query])
         faiss.normalize_L2(qvec)
         scores, idxs = self._index.search(qvec, k)
-        out = []
-        for score, idx in zip(scores[0], idxs[0]):
+        out: list[SearchHit] = []
+        for score, idx in zip(scores[0].tolist(), idxs[0].tolist()):
             if idx < 0:
                 continue
-            rec = dict(self._records[idx])
-            rec["score"] = round(float(score), 4)
-            out.append(rec)
+            rec = self._records[idx]
+            out.append(
+                SearchHit(
+                    log_id=rec["log_id"],
+                    site_id=rec["site_id"],
+                    event_type=rec["event_type"],
+                    date=rec["date"],
+                    text=rec["text"],
+                    score=round(score, 4),
+                )
+            )
         return out
+
+
+def _read_records(path: Path) -> list[MaintenanceLog]:
+    with open(path) as f:
+        return cast(list[MaintenanceLog], json.load(f))
 
 
 if __name__ == "__main__":

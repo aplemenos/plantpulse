@@ -25,6 +25,9 @@ jobs:
           GIT_COMMIT: ${{ github.sha }}
         run: make pipeline
 
+      - name: Type check (pyright strict) and lint (ruff)
+        run: make lint
+
       - name: Unit, contract and agent tests
         run: make test
 

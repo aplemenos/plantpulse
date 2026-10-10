@@ -29,13 +29,16 @@ import hashlib
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import joblib
 import mlflow
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
+from sklearn.base import BaseEstimator
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier
 from sklearn.metrics import (
     f1_score,
@@ -67,7 +70,7 @@ def _git_commit() -> str:
         return subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, text=True
         ).strip()
-    except Exception:
+    except (OSError, subprocess.CalledProcessError):  # git missing, or not a git checkout
         return "unknown"
 
 
@@ -79,16 +82,22 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()[:16]
 
 
-def register_model(model_name: str, model_obj, feature_list: list[str], metrics: dict, params: dict) -> str:
-    version = datetime.now(timezone.utc).strftime("v%Y%m%d_%H%M%S")
+def register_model(
+    model_name: str,
+    model_obj: BaseEstimator,
+    feature_list: list[str],
+    metrics: dict[str, float],
+    params: dict[str, Any],
+) -> str:
+    version = datetime.now(UTC).strftime("v%Y%m%d_%H%M%S")
     out_dir = ARTIFACTS_DIR / model_name / version
     out_dir.mkdir(parents=True, exist_ok=True)
 
     joblib.dump(model_obj, out_dir / "model.joblib")
-    metadata = {
+    metadata: dict[str, Any] = {
         "model_name": model_name,
         "version": version,
-        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "trained_at": datetime.now(UTC).isoformat(),
         "git_commit": _git_commit(),
         "data_file": str(DATA_PATH.relative_to(ROOT)),
         "data_sha256_16": _sha256(DATA_PATH),
@@ -107,12 +116,14 @@ def register_model(model_name: str, model_obj, feature_list: list[str], metrics:
     return version
 
 
-def time_split(df: pd.DataFrame, train_frac: float = 0.8):
+def time_split(df: pd.DataFrame, train_frac: float = 0.8) -> tuple[pd.DataFrame, pd.DataFrame]:
     cutoff = df["timestamp"].quantile(train_frac)
     return df[df["timestamp"] < cutoff].copy(), df[df["timestamp"] >= cutoff].copy()
 
 
-def train_expected_power(train_df: pd.DataFrame, test_df: pd.DataFrame):
+def train_expected_power(
+    train_df: pd.DataFrame, test_df: pd.DataFrame
+) -> tuple[GradientBoostingRegressor, dict[str, float]]:
     healthy_train = train_df[(train_df.is_anomaly == 0) & (train_df.is_curtailed == 0)]
 
     model = GradientBoostingRegressor(
@@ -135,12 +146,15 @@ def train_expected_power(train_df: pd.DataFrame, test_df: pd.DataFrame):
     return model, metrics
 
 
-def _naive_anomaly_baseline(df: pd.DataFrame, threshold: float = -0.2) -> np.ndarray:
+def _naive_anomaly_baseline(df: pd.DataFrame, threshold: float = -0.2) -> NDArray[np.int64]:
     """Flag anomaly if residual is >20% below expected and not a known curtailment."""
-    return ((df["residual_pct"] < threshold) & (df["is_curtailed"] == 0)).astype(int).values
+    flagged = (df["residual_pct"] < threshold) & (df["is_curtailed"] == 0)
+    return flagged.to_numpy(dtype=np.int64)
 
 
-def train_anomaly_detector(train_df: pd.DataFrame, test_df: pd.DataFrame):
+def train_anomaly_detector(
+    train_df: pd.DataFrame, test_df: pd.DataFrame
+) -> tuple[RandomForestClassifier, dict[str, float], dict[str, float]]:
     X_train, y_train = train_df[ANOMALY_FEATURES], train_df["is_anomaly"]
     X_test, y_test = test_df[ANOMALY_FEATURES], test_df["is_anomaly"]
 
@@ -182,7 +196,9 @@ def train_anomaly_detector(train_df: pd.DataFrame, test_df: pd.DataFrame):
     return model, model_metrics, baseline_metrics
 
 
-def train_forecaster(train_fc: pd.DataFrame, test_fc: pd.DataFrame):
+def train_forecaster(
+    train_fc: pd.DataFrame, test_fc: pd.DataFrame
+) -> tuple[GradientBoostingRegressor, dict[str, float]]:
     train_fc = train_fc.dropna(subset=FORECAST_FEATURES + ["target_power_kw"])
     test_fc = test_fc.dropna(subset=FORECAST_FEATURES + ["target_power_kw"])
 
@@ -209,7 +225,7 @@ def train_forecaster(train_fc: pd.DataFrame, test_fc: pd.DataFrame):
     return model, metrics
 
 
-def main():
+def main() -> None:
     mlflow.set_tracking_uri(f"file:{MLFLOW_DIR}")
     mlflow.set_experiment("plantpulse")
 
@@ -217,10 +233,11 @@ def main():
     df = add_expected_power_features(raw)
 
     train_df, test_df = time_split(df)
-    expected_power_model, ep_metrics = train_expected_power(train_df, test_df)
+    expected_power_model, _ = train_expected_power(train_df, test_df)
 
-    df["expected_power_kw"] = expected_power_model.predict(df[EXPECTED_POWER_FEATURES])
-    df_feat = add_anomaly_features(df, df["expected_power_kw"].values)
+    expected_power = expected_power_model.predict(df[EXPECTED_POWER_FEATURES])
+    df["expected_power_kw"] = expected_power
+    df_feat = add_anomaly_features(df, expected_power)
     train_a, test_a = time_split(df_feat)
     train_anomaly_detector(train_a, test_a)
 

@@ -9,25 +9,40 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
-
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
 
-from app.inference import NotEnoughData, batch_predict_anomaly, predict_anomaly, predict_forecast, search_logs
-from app.schemas import AgentQueryRequest, AnomalyRequest, BatchRequest, ForecastRequest, SearchRequest
-from app.state import AppState
+from app.inference import (
+    NotEnoughData,
+    Prediction,
+    batch_predict_anomaly,
+    predict_anomaly,
+    predict_forecast,
+    search_logs,
+)
+from app.schemas import (
+    AgentQueryRequest,
+    AnomalyRequest,
+    BatchRequest,
+    ForecastRequest,
+    SearchRequest,
+)
+from app.state import AppState, FlaggedMoment, SiteInfo
 from ml.features import ANOMALY_FEATURES
+from ml.vector_store import SearchHit
 
 _state: AppState | None = None
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     global _state
     _state = AppState()
     print(f"[startup] models loaded: {_state.registry.versions()}")
@@ -48,23 +63,23 @@ INDEX_HTML = Path(__file__).resolve().parent / "static" / "index.html"
 
 
 @app.get("/", include_in_schema=False)
-def index():
+def index() -> FileResponse:
     return FileResponse(INDEX_HTML)
 
 
 @app.get("/health")
-def health():
+def health() -> dict[str, Any]:
     state = get_state()
     return {"status": "ok", "model_versions": state.registry.versions(), "cache": state.cache.stats()}
 
 
 @app.get("/sites")
-def sites():
+def sites() -> list[SiteInfo]:
     return get_state().sites
 
 
 @app.post("/predict/anomaly")
-def anomaly(req: AnomalyRequest):
+def anomaly(req: AnomalyRequest) -> Prediction:
     try:
         return predict_anomaly(get_state(), req.site_id, req.as_of)
     except NotEnoughData as exc:
@@ -72,7 +87,7 @@ def anomaly(req: AnomalyRequest):
 
 
 @app.post("/predict/forecast")
-def forecast(req: ForecastRequest):
+def forecast(req: ForecastRequest) -> Prediction:
     try:
         return predict_forecast(get_state(), req.site_id, req.as_of)
     except NotEnoughData as exc:
@@ -80,29 +95,31 @@ def forecast(req: ForecastRequest):
 
 
 @app.post("/predict/batch")
-def batch(req: BatchRequest):
+def batch(req: BatchRequest) -> list[Prediction]:
     return batch_predict_anomaly(get_state(), req.site_ids, req.as_of)
 
 
 @app.post("/search/logs")
-def logs(req: SearchRequest):
+def logs(req: SearchRequest) -> list[SearchHit]:
     return search_logs(get_state(), req.query, req.k)
 
 
 @app.post("/agent/query")
-def agent_query(req: AgentQueryRequest):
-    from agent.orchestrator import answer_question  # local import avoids a hard startup dependency
+def agent_query(req: AgentQueryRequest) -> dict[str, Any]:
+    from agent.orchestrator import (
+        answer_question,  # local import avoids a hard startup dependency
+    )
 
     return answer_question(get_state(), req.question)
 
 
 @app.get("/debug/cache-stats")
-def cache_stats():
+def cache_stats() -> dict[str, Any]:
     return get_state().cache.stats()
 
 
 @app.get("/sites/{site_id}/top-flagged")
-def top_flagged(site_id: str):
+def top_flagged(site_id: str) -> FlaggedMoment:
     moment = get_state().top_flagged_moment(site_id)
     if moment is None:
         raise HTTPException(404, f"no data for site_id={site_id!r}")
@@ -110,7 +127,9 @@ def top_flagged(site_id: str):
 
 
 @app.get("/stream/telemetry/{site_id}")
-async def stream_telemetry(site_id: str, speed: float = 20.0, tail: int = 200, start: str | None = None):
+async def stream_telemetry(
+    site_id: str, speed: float = 20.0, tail: int = 200, start: str | None = None
+) -> EventSourceResponse:
     """Server-Sent Events: replays a site's telemetry at an accelerated rate
     (`speed`x real time), running the anomaly model live on each event as
     it's emitted - the real-time inference path. Replays the last `tail`
@@ -129,13 +148,12 @@ async def stream_telemetry(site_id: str, speed: float = 20.0, tail: int = 200, s
     real_interval_s = 15 * 60  # data is at 15-minute resolution
     sleep_s = max(real_interval_s / speed, 0.05)
 
-    async def event_generator():
+    async def event_generator() -> AsyncIterator[dict[str, str]]:
         features = site_df[ANOMALY_FEATURES]
-        for i, row in site_df.iterrows():
-            proba = float(
-                state.registry.anomaly_detector.model.predict_proba(features.iloc[[i]])[0, 1]
-            )
-            payload = {
+        for i in range(len(site_df)):
+            row = site_df.iloc[i]
+            proba = float(state.registry.anomaly_detector.model.predict_proba(features.iloc[[i]])[0, 1])
+            payload: dict[str, Any] = {
                 "site_id": site_id,
                 "timestamp": str(row["timestamp"]),
                 "power_kw": round(float(row["power_kw"]), 2),

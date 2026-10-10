@@ -11,9 +11,12 @@ Process-wide application state, built once at startup:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
+from typing_extensions import TypedDict  # pydantic needs this on Python < 3.12
 
 from app.cache import build_cache
 from app.registry import ModelRegistry
@@ -30,8 +33,20 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_PATH = ROOT / "data" / "telemetry.csv"
 
 
+class SiteInfo(TypedDict):
+    site_id: str
+    site_type: str
+    capacity_kw: float
+
+
+class FlaggedMoment(TypedDict):
+    site_id: str
+    timestamp: str
+    anomaly_probability: float
+
+
 class AppState:
-    def __init__(self):
+    def __init__(self) -> None:
         self.registry = ModelRegistry()
         self.cache = build_cache()
 
@@ -50,21 +65,23 @@ class AppState:
             self.df[ANOMALY_FEATURES]
         )[:, 1]
 
-        self.sites = (
+        self.sites = cast(
+            list[SiteInfo],
             self.df[["site_id", "site_type", "capacity_kw"]]
             .drop_duplicates()
             .sort_values("site_id")
-            .to_dict(orient="records")
+            .to_dict(orient="records"),
         )
 
         # Per-site index (sorted by time) so a lookup is a dict hit + binary
         # search instead of a boolean scan over every row in the fleet.
-        self._site_frames = {
-            site_id: frame.reset_index(drop=True)
+        self._site_frames: dict[str, pd.DataFrame] = {
+            str(site_id): frame.reset_index(drop=True)
             for site_id, frame in self.df.groupby("site_id", sort=False)
         }
-        self._site_ts = {
-            site_id: frame["timestamp"].to_numpy() for site_id, frame in self._site_frames.items()
+        self._site_ts: dict[str, NDArray[np.datetime64]] = {
+            site_id: frame["timestamp"].to_numpy(dtype="datetime64[ns]")
+            for site_id, frame in self._site_frames.items()
         }
 
     def site_frame(self, site_id: str, as_of: str | None = None) -> pd.DataFrame:
@@ -73,15 +90,21 @@ class AppState:
             return self.df.iloc[0:0]
         if as_of is None:
             return frame
-        cutoff = np.searchsorted(self._site_ts[site_id], np.datetime64(pd.Timestamp(as_of)), side="right")
+        cutoff = int(
+            np.searchsorted(self._site_ts[site_id], np.datetime64(pd.Timestamp(as_of)), side="right")
+        )
         return frame.iloc[:cutoff]
 
-    def top_flagged_moment(self, site_id: str) -> dict | None:
+    def top_flagged_moment(self, site_id: str) -> FlaggedMoment | None:
         frame = self._site_frames.get(site_id)
         if frame is None:
             return None
         # exclude known curtailment: the model already treats it as benign
         candidates = frame[frame["is_curtailed"] == 0]
-        row = candidates.loc[candidates["model_anomaly_proba"].idxmax()]
-        return {"site_id": site_id, "timestamp": str(row["timestamp"]),
-                "anomaly_probability": round(float(row["model_anomaly_proba"]), 4)}
+        position = int(np.argmax(candidates["model_anomaly_proba"].to_numpy(dtype=np.float64)))
+        row = candidates.iloc[position]
+        return {
+            "site_id": site_id,
+            "timestamp": str(row["timestamp"]),
+            "anomaly_probability": round(float(row["model_anomaly_proba"]), 4),
+        }

@@ -1,4 +1,5 @@
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -9,15 +10,7 @@ sys.path.insert(0, str(ROOT))
 
 
 @pytest.fixture(scope="session")
-def client(monkeypatch_session):
-    from app.main import app
-
-    with TestClient(app) as c:  # context manager runs the lifespan (model loading)
-        yield c
-
-
-@pytest.fixture(scope="session")
-def monkeypatch_session():
+def monkeypatch_session() -> Iterator[pytest.MonkeyPatch]:
     # Force the deterministic rule-based agent path and the in-process cache in tests,
     # regardless of what's set in the developer's shell.
     mp = pytest.MonkeyPatch()
@@ -25,3 +18,11 @@ def monkeypatch_session():
     mp.delenv("REDIS_URL", raising=False)
     yield mp
     mp.undo()
+
+
+@pytest.fixture(scope="session")
+def client(monkeypatch_session: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    from app.main import app
+
+    with TestClient(app) as c:  # context manager runs the lifespan (model loading)
+        yield c

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
 
 ROLL_WINDOW = 8  # 8 * 15min = 2h rolling window for drift/residual smoothing
 
@@ -32,7 +33,7 @@ EXPECTED_POWER_FEATURES = [
 ]
 
 
-def add_anomaly_features(df: pd.DataFrame, expected_power: np.ndarray) -> pd.DataFrame:
+def add_anomaly_features(df: pd.DataFrame, expected_power: NDArray[np.float64]) -> pd.DataFrame:
     """Residual + drift/vibration features used by the anomaly classifier.
 
     `expected_power` must already be computed (model output or ground truth)

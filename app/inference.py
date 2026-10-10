@@ -5,17 +5,20 @@ the agent's tools - one implementation, multiple entry points.
 
 from __future__ import annotations
 
-import pandas as pd
+from typing import Any
 
 from app.state import AppState
 from ml.features import ANOMALY_FEATURES, FORECAST_FEATURES
+from ml.vector_store import SearchHit
+
+Prediction = dict[str, Any]
 
 
 class NotEnoughData(ValueError):
     pass
 
 
-def predict_anomaly(state: AppState, site_id: str, as_of: str | None = None) -> dict:
+def predict_anomaly(state: AppState, site_id: str, as_of: str | None = None) -> Prediction:
     cache_key = f"anomaly:{site_id}:{as_of or 'latest'}"
     cached = state.cache.get(cache_key)
     if cached is not None:
@@ -29,7 +32,7 @@ def predict_anomaly(state: AppState, site_id: str, as_of: str | None = None) -> 
     proba = float(
         state.registry.anomaly_detector.model.predict_proba(site_df[ANOMALY_FEATURES].iloc[[-1]])[0, 1]
     )
-    result = {
+    result: Prediction = {
         "site_id": site_id,
         "timestamp": str(row["timestamp"]),
         "is_anomaly": bool(proba >= 0.5),
@@ -45,7 +48,7 @@ def predict_anomaly(state: AppState, site_id: str, as_of: str | None = None) -> 
     return result
 
 
-def predict_forecast(state: AppState, site_id: str, as_of: str | None = None) -> dict:
+def predict_forecast(state: AppState, site_id: str, as_of: str | None = None) -> Prediction:
     cache_key = f"forecast:{site_id}:{as_of or 'latest'}"
     cached = state.cache.get(cache_key)
     if cached is not None:
@@ -56,14 +59,14 @@ def predict_forecast(state: AppState, site_id: str, as_of: str | None = None) ->
         raise NotEnoughData(f"no telemetry for site_id={site_id!r} as_of={as_of!r}")
     row = site_df.iloc[-1]
     feat_row = site_df[FORECAST_FEATURES].iloc[[-1]]
-    if feat_row.isna().any(axis=None):
+    if bool(feat_row.isna().to_numpy().any()):
         raise NotEnoughData(
             f"not enough history yet for site_id={site_id!r} as_of={as_of!r} "
             "(forecaster needs up to 1 day of prior readings)"
         )
 
     forecast_kw = float(state.registry.forecaster.model.predict(feat_row)[0])
-    result = {
+    result: Prediction = {
         "site_id": site_id,
         "as_of": str(row["timestamp"]),
         "forecast_horizon_minutes": 60,
@@ -76,14 +79,14 @@ def predict_forecast(state: AppState, site_id: str, as_of: str | None = None) ->
     return result
 
 
-def search_logs(state: AppState, query: str, k: int = 3) -> list[dict]:
+def search_logs(state: AppState, query: str, k: int = 3) -> list[SearchHit]:
     return state.vector_store.search(query, k=k)
 
 
-def batch_predict_anomaly(state: AppState, site_ids: list[str], as_of: str | None = None) -> list[dict]:
+def batch_predict_anomaly(state: AppState, site_ids: list[str], as_of: str | None = None) -> list[Prediction]:
     """Serial baseline - see ml/benchmark_parallel.py for the concurrent version
     and the measured throughput comparison."""
-    out = []
+    out: list[Prediction] = []
     for site_id in site_ids:
         try:
             out.append(predict_anomaly(state, site_id, as_of))

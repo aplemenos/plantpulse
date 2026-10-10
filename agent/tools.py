@@ -8,10 +8,14 @@ One set of underlying functions, two ways of deciding when to call them.
 
 from __future__ import annotations
 
+from typing import Any
+
+from anthropic.types import ToolParam
+
 from app.inference import NotEnoughData, predict_anomaly, predict_forecast, search_logs
 from app.state import AppState
 
-TOOL_SPECS = [
+TOOL_SPECS: list[ToolParam] = [
     {
         "name": "check_anomaly",
         "description": (
@@ -60,7 +64,7 @@ TOOL_SPECS = [
 ]
 
 
-def dispatch(state: AppState, tool_name: str, tool_input: dict) -> dict:
+def dispatch(state: AppState, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
     try:
         if tool_name == "check_anomaly":
             return predict_anomaly(state, tool_input["site_id"], tool_input.get("as_of"))

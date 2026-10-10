@@ -1,6 +1,6 @@
 PY ?= python
 
-.PHONY: install data train index pipeline test regress baseline bench serve docker
+.PHONY: install data train index pipeline test lint regress baseline bench serve docker
 
 install:
 	$(PY) -m pip install -r requirements-dev.txt
@@ -18,6 +18,10 @@ pipeline: data train index   ## regenerate data, retrain, rebuild vector index
 
 test:
 	$(PY) -m pytest -q
+
+lint:                         ## pyright (strict) + ruff
+	$(PY) -m pyright
+	$(PY) -m ruff check app agent ml tests
 
 regress:                      ## fail if quality/latency/routing regressed vs baseline
 	$(PY) -m ml.regression_check
