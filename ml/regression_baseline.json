@@ -5,5 +5,8 @@
   "expected_power_mae_kw": 17.286,
   "forecast_mae_kw": 54.386,
   "latency_p95_ms": 17.47,
-  "agent_routing_accuracy": 1.0
+  "agent_routing_accuracy": 1.0,
+  "retrieval_tfidf_hit_at_3": 0.9375,
+  "retrieval_tfidf_precision_at_3": 0.75,
+  "retrieval_tfidf_mrr": 0.9375
 }

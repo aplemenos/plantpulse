@@ -11,3 +11,4 @@ mlartifacts/
 !/data/*.dvc
 ml/regression_history.jsonl
 .env
+.cache/

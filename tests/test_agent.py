@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from agent.orchestrator import extract_intents, extract_site_ids
@@ -76,3 +77,64 @@ def test_agent_query_is_traced_end_to_end(client: TestClient) -> None:
     assert spans["search_maintenance_logs"].span_type == "RETRIEVER"
     assert spans["search_maintenance_logs"].outputs[0]["page_content"]
     assert trace.info.tags["agent.mode"] == "rule_based"
+
+
+def test_citations_are_checked_against_what_was_retrieved() -> None:
+    from agent.orchestrator import check_citations
+
+    tool_calls = [{"tool": "search_maintenance_logs", "input": {}, "output": {"results": [{"log_id": "log-0009"}]}}]
+    supported, unsupported = check_citations("Seen before [log-0009], also [log-0042]; see [log-0009].", tool_calls)
+    assert supported == ["log-0009"] and unsupported == ["log-0042"]
+
+
+def test_rule_based_answer_cites_the_logs_it_used(client: TestClient) -> None:
+    body = client.post("/agent/query", json={"question": "have we seen this vibration before on wind-3"}).json()
+    search = next(c for c in body["tool_calls"] if c["tool"] == "search_maintenance_logs")
+    assert search["input"]["site_id"] == "wind-03"
+    retrieved = [h["log_id"] for h in search["output"]["results"]]
+    assert body["citations"] == retrieved and body["unsupported_citations"] == []
+
+
+def test_llm_loop_formats_tool_results_and_checks_citations(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drive the real tool-use loop with a scripted stand-in for Claude."""
+    from types import SimpleNamespace
+    from typing import Any
+
+    import anthropic
+    from anthropic.types import TextBlock, ToolUseBlock
+
+    import app.main
+    from agent.orchestrator import answer_question
+
+    sent: list[dict[str, Any]] = []
+    tool_results: list[str] = []  # captured per call: the loop keeps appending to `messages`
+
+    class FakeMessages:
+        def create(self, **kwargs: Any) -> Any:
+            sent.append(kwargs)
+            if len(sent) == 1:  # first turn: Claude asks for a log search
+                return SimpleNamespace(content=[ToolUseBlock(
+                    type="tool_use", id="t1", name="search_maintenance_logs",
+                    input={"query": "inverter overheating", "k": 2},
+                )])
+            # second turn: answer citing the first log it was shown, plus one it never saw
+            tool_results.append(kwargs["messages"][-1]["content"][0]["content"])
+            first_id = tool_results[0].split("[", 1)[1].split("]", 1)[0]
+            return SimpleNamespace(content=[TextBlock(type="text", text=f"Yes - see [{first_id}]. Also [log-9999].")])
+
+    class FakeAnthropic:
+        def __init__(self, api_key: str) -> None:
+            self.messages = FakeMessages()
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(anthropic, "Anthropic", FakeAnthropic)
+
+    body = answer_question(app.main.get_state(), "has an inverter overheated before?")
+
+    assert body["mode"] == "llm" and "cite" in sent[0]["system"]
+    assert tool_results[0].startswith("1. [log-")  # numbered, citable snippets - not a raw dict
+    first_retrieved = body["tool_calls"][0]["output"]["results"][0]["log_id"]
+    assert body["citations"] == [first_retrieved]
+    assert body["unsupported_citations"] == ["log-9999"]

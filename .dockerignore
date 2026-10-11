@@ -11,3 +11,4 @@ ml/artifacts
 ml/regression_history.jsonl
 tests
 notebooks
+.cache/

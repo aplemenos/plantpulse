@@ -24,6 +24,9 @@ COPY agent agent
 # which the CI regression check verifies.
 ARG GIT_COMMIT=unknown
 ENV GIT_COMMIT=${GIT_COMMIT}
+# auto = bge-small embeddings (downloaded into the image at build time), tfidf if unavailable
+ARG PLANTPULSE_EMBEDDER=auto
+ENV PLANTPULSE_EMBEDDER=${PLANTPULSE_EMBEDDER}
 RUN python -m ml.data_generation \
     && python -m ml.train \
     && python -m ml.vector_store

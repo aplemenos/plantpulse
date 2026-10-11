@@ -8,3 +8,5 @@ class TfidfVectorizer(BaseEstimator):
         min_df: int | float = ...,
         stop_words: str | list[str] | None = ...,
     ) -> None: ...
+
+ENGLISH_STOP_WORDS: frozenset[str]

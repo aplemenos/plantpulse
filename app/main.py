@@ -23,6 +23,7 @@ from agent.tracing import ensure_tracing, flush_traces, tracing_enabled
 from app.inference import (
     NotEnoughData,
     Prediction,
+    UnknownSite,
     batch_predict_anomaly,
     predict_anomaly,
     predict_forecast,
@@ -78,6 +79,7 @@ def health() -> dict[str, Any]:
         "status": "ok",
         "model_versions": state.registry.versions(),
         "models": state.registry.describe(),
+        "retrieval": {**state.vector_store.info, "mode": "hybrid (vector + BM25, RRF)"},
         "cache": state.cache.stats(),
     }
 
@@ -110,7 +112,10 @@ def batch(req: BatchRequest) -> list[Prediction]:
 
 @app.post("/search/logs")
 def logs(req: SearchRequest) -> list[SearchHit]:
-    return search_logs(get_state(), req.query, req.k)
+    try:
+        return search_logs(get_state(), req.query, req.k, req.site_id)
+    except UnknownSite as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.post("/agent/query")

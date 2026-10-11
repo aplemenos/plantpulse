@@ -1,6 +1,6 @@
 PY ?= python
 
-.PHONY: install data train index pipeline test lint regress baseline bench serve docker mlflow-ui models
+.PHONY: install data train index pipeline test lint regress baseline bench serve docker mlflow-ui models retrieval
 
 install:
 	$(PY) -m pip install -r requirements-dev.txt
@@ -23,11 +23,14 @@ lint:                         ## pyright (strict) + ruff
 	$(PY) -m pyright
 	$(PY) -m ruff check app agent ml tests
 
-regress:                      ## fail if quality/latency/routing regressed vs baseline
+regress:                      ## fail if quality/latency/routing/retrieval regressed vs baseline
 	$(PY) -m ml.regression_check
 
 baseline:                     ## accept current numbers as the new baseline
 	$(PY) -m ml.regression_check --update-baseline
+
+retrieval:                    ## compare vector / BM25 / hybrid search on the golden queries
+	$(PY) -m ml.retrieval_eval
 
 bench:
 	$(PY) -m ml.benchmark_parallel

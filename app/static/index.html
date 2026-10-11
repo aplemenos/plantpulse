@@ -161,6 +161,8 @@ $("ask").onsubmit = async (e) => {
   $("traceBody").textContent = JSON.stringify(res.tool_calls, null, 2);
   $("trace").hidden = false;
   const traceRef = res.trace_id ? ` · MLflow trace ${res.trace_id}` : "";
+  if (res.unsupported_citations?.length)
+    $("answer").textContent += `\n\n(Cites logs that were never retrieved: ${res.unsupported_citations.join(", ")})`;
   $("trace").querySelector("summary").textContent =
     `Tool calls (${res.tool_calls.length}, mode: ${res.mode}${res.llm_error ? ", LLM failed - fell back" : ""})${traceRef}`;
 };

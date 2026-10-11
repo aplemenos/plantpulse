@@ -21,6 +21,7 @@ class BatchRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: str
     k: int = 3
+    site_id: str | None = None
 
 
 class AgentQueryRequest(BaseModel):

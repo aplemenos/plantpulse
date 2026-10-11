@@ -9,6 +9,8 @@ scikit-learn==1.5.2
 joblib==1.4.2
 mlflow==3.17.0
 faiss-cpu==1.9.0.post1
+fastembed==0.5.1          # bge-small embeddings (ONNX, CPU)
+py-rust-stemmers==0.1.8   # Snowball stemming for BM25
 httpx==0.28.1
 anthropic==1.1.0
 redis==5.2.1

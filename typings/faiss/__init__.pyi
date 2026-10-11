@@ -4,6 +4,7 @@ from numpy.typing import NDArray
 
 class Index:
     ntotal: int
+    d: int
     def add(self, x: NDArray[np.float32]) -> None: ...
     def search(self, x: NDArray[np.float32], k: int) -> tuple[NDArray[np.float32], NDArray[np.int64]]: ...
 

@@ -25,7 +25,7 @@ flowchart LR
       C --> EP[Expected-power<br/>regressor]
       EP --> AD[Anomaly classifier]
       C --> F1[1h forecaster]
-      VS --> IDX[(FAISS index)]
+      VS --> IDX[(Hybrid search<br/>FAISS vectors + BM25)]
     end
 
     subgraph Offline [Training pipeline]
@@ -68,11 +68,11 @@ The regression check caught the latency problem and a real agent-routing bug ("h
 | Integrate ML into production pipelines and APIs | `app/` FastAPI service; models load once at startup from the MLflow Model Registry (`@champion`), after a signature check |
 | Optimize latency, throughput, memory | Measured latency fix above; `ml/benchmark_parallel.py` (naive vs vectorized vs process pool, results asserted identical) |
 | Model-serving infrastructure (API, batch, streaming) | REST endpoints, `/predict/batch`, and **SSE `/stream/telemetry`** running live per-event inference |
-| Testing and validation frameworks for ML | `tests/`: feature-skew, leakage, API-contract, registry/promotion, agent and tracing tests (33) |
+| Testing and validation frameworks for ML | `tests/`: feature-skew, leakage, API-contract, registry/promotion, agent and tracing, retrieval and citation tests (49) |
 | Caching and provenance for models, code and data | Redis/in-process prediction cache; **DVC** for data and artifacts; **MLflow** runs tagged with data hash and git commit, models logged with signatures, `/health` reports which registry version and run each served model came from |
 | CI/CD for model deployment | `.github/workflows/ci.yml`: rebuild from source, then tests, then regression gate, then image build and container smoke test, then deploy |
-| Regression testing to monitor the analytics engine | `ml/regression_check.py`: quality, p95 latency, agent-routing accuracy and data contract against a committed baseline, with run history for trends |
-| Vector DBs / embeddings | FAISS index behind an `Embedder` interface (see the honest note below) |
+| Regression testing to monitor the analytics engine | `ml/regression_check.py`: quality, p95 latency, agent-routing accuracy, retrieval quality and data contract against a committed baseline, with run history for trends |
+| Vector DBs / embeddings / RAG | Hybrid search (FAISS vectors + BM25, fused with RRF) with a per-site filter; bge-small embeddings; answers cite log ids, checked against what was retrieved |
 | Agent layer integration | `agent/`: Anthropic tool-use loop, plus a deterministic fallback that calls the *same* tools; every question is an **MLflow trace** |
 
 ## Run it
@@ -80,8 +80,9 @@ The regression check caught the latency problem and a real agent-routing bug ("h
 ```bash
 make install         # pip install -r requirements-dev.txt
 make pipeline        # generate seeded data -> train (MLflow) -> build vector index
-make test            # 33 tests
+make test            # 49 tests
 make regress         # regression gate vs ml/regression_baseline.json
+make retrieval       # vector vs BM25 vs hybrid search on the golden queries
 make serve           # http://localhost:8000  (UI at /, API docs at /docs)
 make mlflow-ui       # http://127.0.0.1:5050  (runs, registered models, agent traces)
 ```
@@ -93,6 +94,26 @@ docker compose up --build    # http://localhost:8000
 ```
 
 To run the agent in **LLM tool-use mode**, set `ANTHROPIC_API_KEY`. Without a key it falls back to a deterministic rule-based planner over the same tools, which keeps it fully runnable offline and testable in CI.
+
+## RAG over maintenance logs
+
+The agent's `search_maintenance_logs` tool is the retrieval half of the RAG setup. Claude calls it when history matters and answers from what comes back.
+
+- **Hybrid search.** Each query is ranked by a dense embedding (FAISS) and by BM25 keyword scoring over Snowball-stemmed tokens. The two rankings are fused with Reciprocal Rank Fusion. Embeddings catch paraphrases ("ran too hot" for "over-temperature fault"). BM25 catches exact part names ("IGBT", "pyranometer").
+- **Embedder.** `BAAI/bge-small-en-v1.5` via fastembed (ONNX, CPU), downloaded once. If it can't be downloaded, the build falls back to TF-IDF plus SVD and says so. Set `PLANTPULSE_EMBEDDER=bge|tfidf|auto` to choose. The embedder used is recorded with the index and reported by `/health`.
+- **Site filter.** `site_id` restricts a search to one site's history (tool input, and `/search/logs`).
+- **Citations.** Claude gets results as numbered snippets with log ids, and the system prompt asks it to cite them (`[log-0009]`). Every response lists `citations`, plus `unsupported_citations` for any cited id that was never retrieved in that conversation. That is a cheap, automatic check for ungrounded answers, and it is shown in the UI and recorded on the trace.
+- **Retrieval eval.** `ml/retrieval_eval.py` holds 16 golden queries written in operator language rather than the logs' wording. It reports hit@3, precision@3 and MRR. The regression gate checks them against a baseline kept per embedder.
+
+With the TF-IDF fallback (the only embedder this project's build sandbox could download):
+
+| Mode | hit@3 | precision@3 | MRR |
+|---|---|---|---|
+| Vector only | 0.94 | 0.75 | 0.90 |
+| BM25 only | 0.94 | 0.79 | 0.94 |
+| **Hybrid** | 0.94 | 0.75 | 0.94 |
+
+On this small, templated corpus (32 logs), keyword search is already strong and hybrid matches it. The case for hybrid is robustness on real, messier logs and with a neural embedder. Run `make baseline` on a machine where bge downloads to start gating its numbers too.
 
 ## MLflow: signatures, registry and agent traces
 
@@ -114,12 +135,12 @@ Storage is a local SQLite store under `ml/artifacts/mlflow/`. It records absolut
 2. In this GitHub repo, add the secret `HF_TOKEN` (a write token) and the variable `HF_SPACE` (for example `your-username/plantpulse`).
 3. Push to `main`. CI deploys automatically, but only after tests and the regression gate pass.
 
-**Render (alternative):** New, then Blueprint, then select this repo; `render.yaml` handles the rest. The free tier has 512 MB of RAM and the service peaks around 330 MB.
+**Render (alternative):** New, then Blueprint, then select this repo; `render.yaml` handles the rest. The free tier has 512 MB of RAM and the service peaks around 330 MB with the TF-IDF embedder, which `render.yaml` selects for that reason.
 
 ## Design decisions and honest limitations
 
 - **Synthetic data.** The telemetry is generated with physically motivated power curves and seeded, injected faults (inverter faults, sensor drift, mechanical wear) plus benign curtailment. Seeding makes the whole pipeline reproducible: a cold rebuild in CI yields bit-identical metrics, which the regression gate verifies.
-- **Embeddings.** The sandbox this was built in blocked model downloads, so the default embedder is TF-IDF plus truncated SVD (offline and deterministic). A neural embedder (`FastEmbedEmbedder`, bge-small) sits behind the same interface and is a one-line swap.
+- **Embeddings.** The default is bge-small, falling back to TF-IDF plus SVD when the model can't be downloaded. The sandbox this was built in blocked model downloads, so the measured retrieval numbers above are for the fallback. The golden set is small (16 queries), so treat its metrics as a regression tripwire, not a benchmark.
 - **Features are precomputed at startup** as a stand-in for a streaming feature pipeline. The serving contract (the model is called at request time, one row per request) is real. In production I'd move feature computation into a streaming job and an online feature store.
 - **The LLM agent path** is implemented against Anthropic's tool-use API but isn't exercised in CI, which runs without credentials. The rule-based path calls the same tool functions and is fully tested. When a Claude call fails, the trace shows the failed call next to the fallback that answered instead.
 - **Parallelism.** On a 2-core runner, vectorization is the lever that matters, and the process pool adds only about 14%. The benchmark exists to *measure* that rather than assume parallelism helps.

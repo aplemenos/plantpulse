@@ -79,8 +79,15 @@ def predict_forecast(state: AppState, site_id: str, as_of: str | None = None) ->
     return result
 
 
-def search_logs(state: AppState, query: str, k: int = 3) -> list[SearchHit]:
-    return state.vector_store.search(query, k=k)
+class UnknownSite(ValueError):
+    pass
+
+
+def search_logs(state: AppState, query: str, k: int = 3, site_id: str | None = None) -> list[SearchHit]:
+    """Hybrid (semantic + keyword) search over maintenance logs, optionally for one site."""
+    if site_id is not None and site_id not in {s["site_id"] for s in state.sites}:
+        raise UnknownSite(f"unknown site_id={site_id!r}")
+    return state.vector_store.search(query, k=k, site_id=site_id)
 
 
 def batch_predict_anomaly(state: AppState, site_ids: list[str], as_of: str | None = None) -> list[Prediction]:

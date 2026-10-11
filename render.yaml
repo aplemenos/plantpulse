@@ -7,5 +7,7 @@ services:
     plan: free
     healthCheckPath: /health
     envVars:
+      - key: PLANTPULSE_EMBEDDER
+        value: tfidf   # skip the neural embedder (onnxruntime + model) to stay inside 512 MB
       - key: ANTHROPIC_API_KEY
         sync: false   # optional: set in the Render dashboard to enable LLM tool-use mode

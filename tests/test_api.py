@@ -97,3 +97,18 @@ def test_index_page_is_served(client: TestClient) -> None:
     r = client.get("/")
     assert r.status_code == 200
     assert "PlantPulse" in r.text
+
+
+def test_log_search_can_be_limited_to_one_site(client: TestClient) -> None:
+    out = client.post("/search/logs", json={"query": "inverter fault", "k": 5, "site_id": "wind-03"}).json()
+    assert out and all(r["site_id"] == "wind-03" for r in out)
+
+
+def test_log_search_unknown_site_is_404(client: TestClient) -> None:
+    r = client.post("/search/logs", json={"query": "inverter fault", "site_id": "wind-99"})
+    assert r.status_code == 404
+
+
+def test_health_reports_retrieval_setup(client: TestClient) -> None:
+    retrieval = client.get("/health").json()["retrieval"]
+    assert retrieval["embedder"] in ("bge", "tfidf") and retrieval["n_records"] > 0

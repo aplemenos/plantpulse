@@ -18,7 +18,13 @@ Two modes, same underlying tools (agent/tools.py):
     dependencies. This is the mode exercised below and in CI.
 
 Both paths return the same response shape:
-{"answer": str, "tool_calls": [...], "mode": "llm" | "rule_based", "trace_id": str}.
+{"answer": str, "tool_calls": [...], "mode": "llm" | "rule_based",
+ "citations": [log ids], "unsupported_citations": [log ids], "trace_id": str}.
+
+Answers that use maintenance logs cite them by id ([log-0009]). Citations
+are checked against what the search tool actually returned in this
+conversation: a cited id that was never retrieved lands in
+unsupported_citations, a cheap signal of an ungrounded answer.
 
 Each question is recorded as one MLflow trace (see agent/tracing.py); the
 response's trace_id opens it in the MLflow UI.
@@ -33,13 +39,22 @@ from typing import Any, cast
 import mlflow
 from mlflow.entities import SpanType
 
-from agent.tools import TOOL_SPECS, dispatch
+from agent.tools import TOOL_SPECS, dispatch, format_tool_result
 from agent.tracing import ensure_tracing, tracing_enabled
 from app.state import AppState
 
 AgentAnswer = dict[str, Any]
 
 _SITE_ID_RE = re.compile(r"\b((?:solar|wind)-0?\d+)\b", re.IGNORECASE)
+_CITATION_RE = re.compile(r"\blog-\d+\b")
+
+SYSTEM_PROMPT = """You are PlantPulse, an analytics assistant for a fleet of solar and wind sites.
+Answer operators' questions using the tools; don't guess numbers you can fetch.
+Low output under a curtailment order is intentional, not a fault - say so when it applies.
+When your answer relies on maintenance logs, cite each one inline by its id in square
+brackets, e.g. [log-0009]. Only cite logs returned by search_maintenance_logs, and say so
+plainly if no similar incident was found. Keep answers short and concrete."""
+
 _HISTORY_RE = re.compile(
     r"\bseen\b.*\bbefore\b|\bsimilar\b|\bhistory\b|\blogs?\b|\bmaintenance\b|\bpast incidents?\b|\bhappened before\b",
     re.IGNORECASE,
@@ -128,13 +143,17 @@ def _rule_based_answer(state: AppState, question: str) -> AgentAnswer:
                 )
 
         if "search_maintenance_logs" in intents:
-            query = question
-            result = dispatch(state, "search_maintenance_logs", {"query": query, "k": 2})
-            tool_calls.append({"tool": "search_maintenance_logs", "input": {"query": query}, "output": result})
+            # Without an LLM to turn the question into a symptom description, the most
+            # useful fallback is the named site's own history, ranked by the question.
+            tool_input: dict[str, Any] = {"query": question, "k": 2, "site_id": site_id}
+            result = dispatch(state, "search_maintenance_logs", tool_input)
+            tool_calls.append({"tool": "search_maintenance_logs", "input": tool_input, "output": result})
             hits = cast(list[dict[str, Any]], result.get("results", []))
             if hits:
-                examples = "; ".join(f"[{h['site_id']}, {h['date']}] {h['text']}" for h in hits)
-                parts.append(f"Similar past incidents: {examples}")
+                examples = " ".join(f"[{h['log_id']}] {h['text']}" for h in hits)
+                parts.append(f"Past incidents at {site_id}: {examples}")
+            else:
+                parts.append(f"No maintenance history found for {site_id}.")
 
     return {"answer": " ".join(parts), "tool_calls": tool_calls, "mode": "rule_based"}
 
@@ -161,6 +180,7 @@ def _llm_answer(state: AppState, question: str, api_key: str) -> AgentAnswer:
         response = client.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=1024,
+            system=SYSTEM_PROMPT,
             tools=TOOL_SPECS,
             messages=messages,
         )
@@ -177,7 +197,7 @@ def _llm_answer(state: AppState, question: str, api_key: str) -> AgentAnswer:
             result = dispatch(state, block.name, tool_input)
             tool_calls.append({"tool": block.name, "input": tool_input, "output": result})
             tool_results.append(
-                {"type": "tool_result", "tool_use_id": block.id, "content": str(result)}
+                {"type": "tool_result", "tool_use_id": block.id, "content": format_tool_result(block.name, result)}
             )
         messages.append({"role": "user", "content": tool_results})
 
@@ -198,12 +218,27 @@ def _answer(state: AppState, question: str) -> AgentAnswer:
     return _rule_based_answer(state, question)
 
 
+def check_citations(answer: str, tool_calls: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """Split the log ids cited in `answer` into (retrieved in this conversation, not retrieved)."""
+    retrieved = {
+        hit["log_id"]
+        for call in tool_calls
+        if call["tool"] == "search_maintenance_logs"
+        for hit in cast(list[dict[str, Any]], call["output"].get("results", []))
+    }
+    cited = list(dict.fromkeys(_CITATION_RE.findall(answer)))  # unique, in order of appearance
+    return [c for c in cited if c in retrieved], [c for c in cited if c not in retrieved]
+
+
 def answer_question(state: AppState, question: str) -> AgentAnswer:
     ensure_tracing()
     with mlflow.start_span(name="agent_query", span_type=SpanType.AGENT) as span:
         span.set_inputs({"question": question})
         result = _answer(state, question)
-        span.set_outputs({"answer": result["answer"], "mode": result["mode"]})
+        result["citations"], result["unsupported_citations"] = check_citations(result["answer"], result["tool_calls"])
+        span.set_outputs({"answer": result["answer"], "mode": result["mode"], "citations": result["citations"]})
+        if result["unsupported_citations"]:
+            span.set_attribute("unsupported_citations", result["unsupported_citations"])
         span.set_attribute("tool_call_count", len(result["tool_calls"]))
         if "llm_error" in result:
             span.set_attribute("llm_error", result["llm_error"])

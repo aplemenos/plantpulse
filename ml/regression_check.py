@@ -8,6 +8,8 @@ window and checks four kinds of behaviour against a committed baseline
   - model quality   : anomaly precision/recall/F1, forecaster + expected-power MAE
   - serving latency : p50/p95 of the real predict_anomaly() path, cache bypassed
   - agent routing   : a golden set of questions -> the tools the agent should call
+  - retrieval       : hit@3 / precision@3 / MRR of maintenance-log search on golden
+                      queries (ml/retrieval_eval.py), baselined per embedder
   - data contract   : schema/row-count/null-rate checks on the input data
 
 Every run is appended to ml/regression_history.jsonl so performance can be
@@ -37,6 +39,7 @@ from agent.orchestrator import extract_intents, extract_site_ids
 from app.inference import predict_anomaly
 from app.state import AppState
 from ml.features import ANOMALY_FEATURES, EXPECTED_POWER_FEATURES, FORECAST_FEATURES
+from ml.retrieval_eval import evaluate as evaluate_retrieval
 from ml.train import time_split
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,6 +56,11 @@ TOLERANCES: dict[str, float] = {
     "latency_p95_ms": 0.50,         # may rise at most 50% relative (noisy on shared CI runners)
     "agent_routing_accuracy": 0.0,  # must not drop at all
 }
+# Retrieval quality depends on the embedder, so each embedder has its own baseline.
+for _embedder in ("bge", "tfidf"):
+    TOLERANCES[f"retrieval_{_embedder}_hit_at_3"] = 0.0     # golden queries that were found must stay found
+    TOLERANCES[f"retrieval_{_embedder}_precision_at_3"] = -0.05
+    TOLERANCES[f"retrieval_{_embedder}_mrr"] = -0.05
 
 GOLDEN_AGENT_QUERIES: list[tuple[str, list[str], list[str]]] = [
     ("is anything wrong with wind-02?", ["wind-02"], ["check_anomaly"]),
@@ -132,10 +140,18 @@ def eval_agent_routing(state: AppState) -> dict[str, Any]:
     }
 
 
+def eval_retrieval(state: AppState) -> dict[str, float]:
+    embedder = state.vector_store.info["embedder"]
+    return {f"retrieval_{embedder}_{k}": v for k, v in evaluate_retrieval(state.vector_store).items()}
+
+
 def compare(current: dict[str, Any], baseline: dict[str, float]) -> list[str]:
-    problems = []
+    problems: list[str] = []
     for key, tol in TOLERANCES.items():
+        if key not in current:
+            continue  # e.g. the other embedder's retrieval metrics
         if key not in baseline:
+            print(f"note: no baseline for {key} yet - run `make baseline` to start gating it")
             continue
         cur, base = current[key], baseline[key]
         lower_is_better = key.endswith(("_kw", "_ms"))
@@ -167,6 +183,7 @@ def main(argv: list[str] | None = None) -> int:
         **eval_quality(state),
         **eval_latency(state),
         **eval_agent_routing(state),
+        **eval_retrieval(state),
     }
 
     record = {
@@ -181,7 +198,9 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(record, indent=2))
 
     if args.update_baseline:
-        baseline = {k: v for k, v in current.items() if k in TOLERANCES}
+        # Merge, so accepting new numbers for one embedder keeps the other's baseline.
+        previous = json.loads(BASELINE_PATH.read_text()) if BASELINE_PATH.exists() else {}
+        baseline = {**previous, **{k: v for k, v in current.items() if k in TOLERANCES}}
         BASELINE_PATH.write_text(json.dumps(baseline, indent=2))
         print(f"\nBaseline updated -> {BASELINE_PATH.relative_to(ROOT)}")
         return 0
