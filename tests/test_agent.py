@@ -47,3 +47,32 @@ def test_agent_asks_for_a_site_when_none_named(client: TestClient) -> None:
     body = client.post("/agent/query", json={"question": "how's everything?"}).json()
     assert body["tool_calls"] == []
     assert "which site" in body["answer"]
+
+
+def test_agent_query_is_traced_end_to_end(client: TestClient) -> None:
+    import mlflow
+
+    body = client.post(
+        "/agent/query", json={"question": "Is anything wrong at wind-02, and have we seen this before?"}
+    ).json()
+    assert body["trace_id"].startswith("tr-")
+
+    mlflow.flush_trace_async_logging()
+    trace = mlflow.get_trace(body["trace_id"])
+    assert trace is not None
+    spans = {s.name: s for s in trace.data.spans}
+
+    root = spans["agent_query"]
+    assert root.parent_id is None and root.span_type == "AGENT"
+    assert root.inputs == {"question": "Is anything wrong at wind-02, and have we seen this before?"}
+    assert root.outputs["answer"] == body["answer"]
+
+    assert spans["route_question"].outputs == {
+        "site_ids": ["wind-02"],
+        "intents": ["check_anomaly", "search_maintenance_logs"],
+    }
+    assert spans["check_anomaly"].span_type == "TOOL"
+    assert spans["check_anomaly"].outputs == body["tool_calls"][0]["output"]
+    assert spans["search_maintenance_logs"].span_type == "RETRIEVER"
+    assert spans["search_maintenance_logs"].outputs[0]["page_content"]
+    assert trace.info.tags["agent.mode"] == "rule_based"

@@ -17,7 +17,11 @@ Two modes, same underlying tools (agent/tools.py):
     so the service and its tests are fully runnable with zero external
     dependencies. This is the mode exercised below and in CI.
 
-Both paths return the same response shape: {"answer": str, "tool_calls": [...]}.
+Both paths return the same response shape:
+{"answer": str, "tool_calls": [...], "mode": "llm" | "rule_based", "trace_id": str}.
+
+Each question is recorded as one MLflow trace (see agent/tracing.py); the
+response's trace_id opens it in the MLflow UI.
 """
 
 from __future__ import annotations
@@ -26,7 +30,11 @@ import os
 import re
 from typing import Any, cast
 
+import mlflow
+from mlflow.entities import SpanType
+
 from agent.tools import TOOL_SPECS, dispatch
+from agent.tracing import ensure_tracing, tracing_enabled
 from app.state import AppState
 
 AgentAnswer = dict[str, Any]
@@ -65,8 +73,11 @@ def extract_intents(question: str) -> list[str]:
 
 def _rule_based_answer(state: AppState, question: str) -> AgentAnswer:
     known_sites = [s["site_id"] for s in state.sites]
-    site_ids = extract_site_ids(question, known_sites)
-    intents = extract_intents(question)
+    with mlflow.start_span(name="route_question", span_type=SpanType.CHAIN) as span:
+        span.set_inputs({"question": question, "known_sites": known_sites})
+        site_ids = extract_site_ids(question, known_sites)
+        intents = extract_intents(question)
+        span.set_outputs({"site_ids": site_ids, "intents": intents})
 
     tool_calls: list[dict[str, Any]] = []
     parts: list[str] = []
@@ -173,7 +184,7 @@ def _llm_answer(state: AppState, question: str, api_key: str) -> AgentAnswer:
     return {"answer": "(agent loop exceeded max turns without a final answer)", "tool_calls": tool_calls, "mode": "llm"}
 
 
-def answer_question(state: AppState, question: str) -> AgentAnswer:
+def _answer(state: AppState, question: str) -> AgentAnswer:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if api_key:
         import anthropic
@@ -185,3 +196,26 @@ def answer_question(state: AppState, question: str) -> AgentAnswer:
             fallback["llm_error"] = str(exc)
             return fallback
     return _rule_based_answer(state, question)
+
+
+def answer_question(state: AppState, question: str) -> AgentAnswer:
+    ensure_tracing()
+    with mlflow.start_span(name="agent_query", span_type=SpanType.AGENT) as span:
+        span.set_inputs({"question": question})
+        result = _answer(state, question)
+        span.set_outputs({"answer": result["answer"], "mode": result["mode"]})
+        span.set_attribute("tool_call_count", len(result["tool_calls"]))
+        if "llm_error" in result:
+            span.set_attribute("llm_error", result["llm_error"])
+        trace_id = span.trace_id
+        if tracing_enabled():
+            # Searchable in the MLflow UI: which mode answered, with which model versions.
+            mlflow.update_current_trace(
+                tags={
+                    "agent.mode": result["mode"],
+                    **{f"model.{k}": v for k, v in state.registry.versions().items()},
+                }
+            )
+    if tracing_enabled():
+        result["trace_id"] = trace_id
+    return result

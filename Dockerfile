@@ -26,8 +26,7 @@ ARG GIT_COMMIT=unknown
 ENV GIT_COMMIT=${GIT_COMMIT}
 RUN python -m ml.data_generation \
     && python -m ml.train \
-    && python -m ml.vector_store \
-    && rm -rf mlruns
+    && python -m ml.vector_store
 
 # Hugging Face Spaces runs containers as uid 1000; Render/Fly set $PORT.
 RUN useradd -m -u 1000 appuser && chown -R appuser /app

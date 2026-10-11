@@ -8,12 +8,15 @@ One set of underlying functions, two ways of deciding when to call them.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
+import mlflow
 from anthropic.types import ToolParam
+from mlflow.entities import Document, SpanType
 
 from app.inference import NotEnoughData, predict_anomaly, predict_forecast, search_logs
 from app.state import AppState
+from ml.vector_store import SearchHit
 
 TOOL_SPECS: list[ToolParam] = [
     {
@@ -64,7 +67,7 @@ TOOL_SPECS: list[ToolParam] = [
 ]
 
 
-def dispatch(state: AppState, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+def _run_tool(state: AppState, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
     try:
         if tool_name == "check_anomaly":
             return predict_anomaly(state, tool_input["site_id"], tool_input.get("as_of"))
@@ -75,3 +78,30 @@ def dispatch(state: AppState, tool_name: str, tool_input: dict[str, Any]) -> dic
         return {"error": f"unknown tool {tool_name!r}"}
     except NotEnoughData as exc:
         return {"error": str(exc)}
+
+
+def _as_documents(hits: list[SearchHit]) -> list[dict[str, Any]]:
+    """Retrieved logs in MLflow's Document shape, so the trace UI renders them as sources."""
+    return [
+        Document(
+            page_content=h["text"],
+            metadata={"site_id": h["site_id"], "event_type": h["event_type"], "date": h["date"], "score": h["score"]},
+            id=h["log_id"],
+        ).to_dict()
+        for h in hits
+    ]
+
+
+def dispatch(state: AppState, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Run one tool inside its own trace span, recording the full input and output."""
+    is_retrieval = tool_name == "search_maintenance_logs"
+    with mlflow.start_span(name=tool_name, span_type=SpanType.RETRIEVER if is_retrieval else SpanType.TOOL) as span:
+        span.set_inputs(tool_input)
+        result = _run_tool(state, tool_name, tool_input)
+        if is_retrieval and "results" in result:
+            span.set_outputs(_as_documents(cast(list[SearchHit], result["results"])))
+        else:
+            span.set_outputs(result)
+        if "error" in result:
+            span.set_attribute("tool_error", result["error"])
+    return result

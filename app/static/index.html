@@ -160,7 +160,9 @@ $("ask").onsubmit = async (e) => {
   $("answer").textContent = res.answer;
   $("traceBody").textContent = JSON.stringify(res.tool_calls, null, 2);
   $("trace").hidden = false;
-  $("trace").querySelector("summary").textContent = `Tool calls (${res.tool_calls.length}, mode: ${res.mode})`;
+  const traceRef = res.trace_id ? ` · MLflow trace ${res.trace_id}` : "";
+  $("trace").querySelector("summary").textContent =
+    `Tool calls (${res.tool_calls.length}, mode: ${res.mode}${res.llm_error ? ", LLM failed - fell back" : ""})${traceRef}`;
 };
 
 for (const ex of EXAMPLES) {

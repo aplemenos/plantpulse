@@ -30,13 +30,14 @@ flowchart LR
 
     subgraph Offline [Training pipeline]
       D[(Seeded telemetry<br/>+ maintenance logs)] --> T[train.py]
-      T --> ML[MLflow runs]
-      T --> R[(Model registry<br/>versioned + metadata)]
-      D -. DVC .-> R
+      T --> ML[MLflow runs<br/>params, metrics, signatures]
+      ML --> R[(MLflow Model Registry<br/>versions + @champion)]
+      D -. DVC .-> T
     end
 
-    R --> EP & AD & F1
+    R -->|"@champion, signature checked"| EP & AD & F1
     SSE[SSE live stream] --> AD
+    AG -. every question .-> TR[(MLflow traces)]
 ```
 
 Anomaly detection is **two-stage**. A regressor learns what a *healthy* site should produce given weather and sensor inputs. A classifier then works on the residual (actual minus expected) together with drift and vibration features. This structure is what lets the system separate real faults from **grid curtailment**, where output is low on purpose. A naive "power dropped" rule can't make that distinction.
@@ -64,24 +65,25 @@ The regression check caught the latency problem and a real agent-routing bug ("h
 
 | Responsibility | Where it lives |
 |---|---|
-| Integrate ML into production pipelines and APIs | `app/` FastAPI service; models load once at startup through a registry |
+| Integrate ML into production pipelines and APIs | `app/` FastAPI service; models load once at startup from the MLflow Model Registry (`@champion`), after a signature check |
 | Optimize latency, throughput, memory | Measured latency fix above; `ml/benchmark_parallel.py` (naive vs vectorized vs process pool, results asserted identical) |
 | Model-serving infrastructure (API, batch, streaming) | REST endpoints, `/predict/batch`, and **SSE `/stream/telemetry`** running live per-event inference |
-| Testing and validation frameworks for ML | `tests/`: feature-skew, leakage, API-contract and agent tests (25) |
-| Caching and provenance for models, code and data | Redis/in-process prediction cache; **DVC** for data and artifacts; registry `metadata.json` per model version (data hash, git commit, features, metrics); **MLflow** for runs |
+| Testing and validation frameworks for ML | `tests/`: feature-skew, leakage, API-contract, registry/promotion, agent and tracing tests (33) |
+| Caching and provenance for models, code and data | Redis/in-process prediction cache; **DVC** for data and artifacts; **MLflow** runs tagged with data hash and git commit, models logged with signatures, `/health` reports which registry version and run each served model came from |
 | CI/CD for model deployment | `.github/workflows/ci.yml`: rebuild from source, then tests, then regression gate, then image build and container smoke test, then deploy |
 | Regression testing to monitor the analytics engine | `ml/regression_check.py`: quality, p95 latency, agent-routing accuracy and data contract against a committed baseline, with run history for trends |
 | Vector DBs / embeddings | FAISS index behind an `Embedder` interface (see the honest note below) |
-| Agent layer integration | `agent/`: Anthropic tool-use loop, plus a deterministic fallback that calls the *same* tools |
+| Agent layer integration | `agent/`: Anthropic tool-use loop, plus a deterministic fallback that calls the *same* tools; every question is an **MLflow trace** |
 
 ## Run it
 
 ```bash
 make install         # pip install -r requirements-dev.txt
 make pipeline        # generate seeded data -> train (MLflow) -> build vector index
-make test            # 25 tests
+make test            # 33 tests
 make regress         # regression gate vs ml/regression_baseline.json
 make serve           # http://localhost:8000  (UI at /, API docs at /docs)
+make mlflow-ui       # http://localhost:5000  (runs, registered models, agent traces)
 ```
 
 With Docker (adds Redis as the shared cache):
@@ -91,6 +93,19 @@ docker compose up --build    # http://localhost:8000
 ```
 
 To run the agent in **LLM tool-use mode**, set `ANTHROPIC_API_KEY`. Without a key it falls back to a deterministic rule-based planner over the same tools, which keeps it fully runnable offline and testable in CI.
+
+## MLflow: signatures, registry and agent traces
+
+- **Signatures.** Every model is logged with its input schema (column names and types) and an input example. At startup the service compares each model's signature with the feature columns it computes and refuses to start on a mismatch, so a model trained on different columns can't be served by accident.
+- **Model Registry.** Each `make train` registers a new version of all three models. A new version is moved to the `@champion` alias only if its primary metric (MAE, or F1 for the detector) is at least as good as the current champion's; otherwise it stays registered, tagged with the reason. The service loads `@champion`.
+
+  ```bash
+  make models                                # versions per model, * = champion
+  python -m ml.promote anomaly_detector 1    # rollback: point @champion at v1, then restart
+  ```
+- **Agent tracing.** Every `/agent/query` is recorded as one trace: the question, the routing decision or each Claude call (prompt, tool choice, tokens, errors), every tool call with full inputs and outputs, and the answer. Traces are tagged with the mode and the model versions that served them. The response includes `trace_id`, which the UI shows. Set `PLANTPULSE_TRACING=0` to turn it off.
+
+Storage is a local SQLite store under `ml/artifacts/mlflow/`. It records absolute artifact paths, so on a new machine regenerate it with `make pipeline`, or set `MLFLOW_TRACKING_URI` to a shared MLflow server.
 
 ## Deploy (free public URL)
 
@@ -106,7 +121,7 @@ To run the agent in **LLM tool-use mode**, set `ANTHROPIC_API_KEY`. Without a ke
 - **Synthetic data.** The telemetry is generated with physically motivated power curves and seeded, injected faults (inverter faults, sensor drift, mechanical wear) plus benign curtailment. Seeding makes the whole pipeline reproducible: a cold rebuild in CI yields bit-identical metrics, which the regression gate verifies.
 - **Embeddings.** The sandbox this was built in blocked model downloads, so the default embedder is TF-IDF plus truncated SVD (offline and deterministic). A neural embedder (`FastEmbedEmbedder`, bge-small) sits behind the same interface and is a one-line swap.
 - **Features are precomputed at startup** as a stand-in for a streaming feature pipeline. The serving contract (the model is called at request time, one row per request) is real. In production I'd move feature computation into a streaming job and an online feature store.
-- **The LLM agent path** is implemented against Anthropic's tool-use API but isn't exercised in CI, which runs without credentials. The rule-based path calls the same tool functions and is fully tested.
+- **The LLM agent path** is implemented against Anthropic's tool-use API but isn't exercised in CI, which runs without credentials. The rule-based path calls the same tool functions and is fully tested. When a Claude call fails, the trace shows the failed call next to the fallback that answered instead.
 - **Parallelism.** On a 2-core runner, vectorization is the lever that matters, and the process pool adds only about 14%. The benchmark exists to *measure* that rather than assume parallelism helps.
 
 ## Roadmap
@@ -116,9 +131,9 @@ Multi-horizon forecasts with prediction intervals · drift monitoring on live fe
 ## Layout
 
 ```
-app/       FastAPI service: registry, cache, inference, SSE stream, UI
-agent/     tool specs + orchestrator (Anthropic tool-use / rule-based fallback)
-ml/        data generation, features, training, vector store, benchmark, regression gate
+app/       FastAPI service: registry loader, cache, inference, SSE stream, UI
+agent/     tool specs, orchestrator (Anthropic tool-use / rule-based fallback), tracing
+ml/        data generation, features, training + MLflow registry/promotion, vector store, benchmark, regression gate
 tests/     feature, API-contract and agent tests
 infra/     deployment helpers
 ```

@@ -1,6 +1,6 @@
 PY ?= python
 
-.PHONY: install data train index pipeline test lint regress baseline bench serve docker
+.PHONY: install data train index pipeline test lint regress baseline bench serve docker mlflow-ui models
 
 install:
 	$(PY) -m pip install -r requirements-dev.txt
@@ -8,7 +8,7 @@ install:
 data:
 	$(PY) -m ml.data_generation
 
-train:
+train:                        ## train, log to MLflow, register; promote to @champion if not worse
 	$(PY) -m ml.train
 
 index:
@@ -31,6 +31,12 @@ baseline:                     ## accept current numbers as the new baseline
 
 bench:
 	$(PY) -m ml.benchmark_parallel
+
+models:                       ## registry versions per model; * marks @champion
+	$(PY) -m ml.promote
+
+mlflow-ui:                    ## runs, registered models and agent traces at http://localhost:5000
+	$(PY) -m mlflow ui --backend-store-uri sqlite:///ml/artifacts/mlflow/mlflow.db --port 5000
 
 serve:
 	$(PY) -m uvicorn app.main:app --reload --port 8000

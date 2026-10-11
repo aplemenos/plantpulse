@@ -16,6 +16,9 @@ def monkeypatch_session() -> Iterator[pytest.MonkeyPatch]:
     mp = pytest.MonkeyPatch()
     mp.delenv("ANTHROPIC_API_KEY", raising=False)
     mp.delenv("REDIS_URL", raising=False)
+    # Keep test traces out of the experiment developers browse.
+    mp.setenv("PLANTPULSE_TRACING", "1")
+    mp.setenv("PLANTPULSE_AGENT_EXPERIMENT", "plantpulse-agent-tests")
     yield mp
     mp.undo()
 

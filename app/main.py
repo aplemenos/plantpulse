@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
 
+from agent.tracing import ensure_tracing, flush_traces, tracing_enabled
 from app.inference import (
     NotEnoughData,
     Prediction,
@@ -47,7 +48,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     _state = AppState()
     print(f"[startup] models loaded: {_state.registry.versions()}")
     print(f"[startup] sites: {[s['site_id'] for s in _state.sites]}")
+    ensure_tracing()
+    print(f"[startup] agent tracing: {'on' if tracing_enabled() else 'off'}")
     yield
+    flush_traces()
 
 
 app = FastAPI(title="PlantPulse", version="0.1.0", lifespan=lifespan)
@@ -70,7 +74,12 @@ def index() -> FileResponse:
 @app.get("/health")
 def health() -> dict[str, Any]:
     state = get_state()
-    return {"status": "ok", "model_versions": state.registry.versions(), "cache": state.cache.stats()}
+    return {
+        "status": "ok",
+        "model_versions": state.registry.versions(),
+        "models": state.registry.describe(),
+        "cache": state.cache.stats(),
+    }
 
 
 @app.get("/sites")

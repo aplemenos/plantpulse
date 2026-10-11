@@ -27,12 +27,12 @@ from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, ParamSpec, TypeVar, cast
 
-import joblib
 import numpy as np
 import pandas as pd
+from mlflow.sklearn import load_model
 from numpy.typing import NDArray
 
-from app.registry import ROOT, Classifier, Regressor, load_current, resolve_current
+from app.registry import ROOT, Classifier, Regressor, champion_local_path, load_champion
 from ml.features import (
     ANOMALY_FEATURES,
     EXPECTED_POWER_FEATURES,
@@ -53,7 +53,7 @@ _worker_model: Classifier | None = None
 
 def _init_worker(model_path: str) -> None:
     global _worker_model
-    model = cast(Classifier, joblib.load(model_path))
+    model = cast(Classifier, load_model(model_path))
     model.set_params(n_jobs=1)  # one core per worker; the pool provides the parallelism
     _worker_model = model
 
@@ -93,14 +93,14 @@ def _timed(fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> tuple[R, fl
 def main() -> None:
     raw = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
     df = add_expected_power_features(raw)
-    expected = load_current("expected_power", Regressor).model.predict(df[EXPECTED_POWER_FEATURES])
+    expected = load_champion("expected_power", Regressor).model.predict(df[EXPECTED_POWER_FEATURES])
     df = add_anomaly_features(df, expected)
     feat = df[ANOMALY_FEATURES].astype("float64")
 
-    detector = load_current("anomaly_detector", Classifier)
-    model_path = str(resolve_current("anomaly_detector") / "model.joblib")
+    detector = load_champion("anomaly_detector", Classifier)
+    model_path = champion_local_path("anomaly_detector")  # workers load from local disk
 
-    # load_current already pins n_jobs=1, so "vectorized" is honestly single-core
+    # load_champion already pins n_jobs=1, so "vectorized" is honestly single-core
     # and the parallel comparison measures process-level scaling, not the
     # forest's own threading.
 

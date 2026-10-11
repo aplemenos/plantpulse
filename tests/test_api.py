@@ -7,6 +7,8 @@ def test_health_reports_model_versions(client: TestClient) -> None:
     body = r.json()
     assert body["status"] == "ok"
     assert set(body["model_versions"]) == {"expected_power", "anomaly_detector", "forecaster_1h"}
+    for model in body["models"].values():
+        assert model["alias"] == "champion" and model["run_id"] and model["metrics"]
 
 
 def test_sites_lists_the_fleet(client: TestClient) -> None:
