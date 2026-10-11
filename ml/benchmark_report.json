@@ -1,25 +1,30 @@
 {
   "rows_scored": 69120,
-  "cpu_cores_available": 2,
+  "cpu_cores_available": 8,
   "naive_serial": {
-    "rows_per_sec": 94.1,
-    "projected_full_run_sec": 734.25
+    "rows_per_sec": 123.2,
+    "projected_full_run_sec": 560.98
   },
   "vectorized_single_core": {
-    "seconds": 0.81,
-    "rows_per_sec": 85351.1,
-    "speedup_vs_naive": 906.7
+    "seconds": 0.691,
+    "rows_per_sec": 100046.3,
+    "speedup_vs_naive": 812.0
   },
   "process_pool": {
     "1": {
-      "seconds": 1.042,
-      "rows_per_sec": 66310.3,
-      "speedup_vs_vectorized": 0.78
+      "seconds": 3.411,
+      "rows_per_sec": 20262.3,
+      "speedup_vs_vectorized": 0.2
     },
     "2": {
-      "seconds": 0.708,
-      "rows_per_sec": 97567.3,
-      "speedup_vs_vectorized": 1.14
+      "seconds": 3.033,
+      "rows_per_sec": 22792.0,
+      "speedup_vs_vectorized": 0.23
+    },
+    "8": {
+      "seconds": 4.759,
+      "rows_per_sec": 14524.6,
+      "speedup_vs_vectorized": 0.15
     }
   },
   "results_identical_across_methods": true

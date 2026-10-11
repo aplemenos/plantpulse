@@ -1,0 +1,1306 @@
+From c052469aea21d0e715cf3cd67f4926df893022e4 Mon Sep 17 00:00:00 2001
+From: Anargyros Plemenos <anargyros.plemenos@gmail.com>
+Date: Sun, 11 Oct 2026 16:25:43 +0300
+Subject: [PATCH] Use MLflow for model signatures, the model registry and agent
+ tracing
+
+- Log every model with a signature and input example; the service checks
+  each champion's signature against the features it computes and refuses
+  to start on a mismatch.
+- Replace the hand-made current.json pointer with the MLflow Model
+  Registry: each training run registers a new version, which becomes
+  @champion only if its primary metric is not worse. The app loads
+  @champion; rollback is `python -m ml.promote <model> <version>`.
+- Trace every agent question in MLflow: routing decision, each Claude
+  call (via anthropic autolog), each tool call with full inputs and
+  outputs, tagged with mode and model versions. Responses carry trace_id.
+- Models are saved with skops instead of pickle; tracking store is SQLite
+  under ml/artifacts/mlflow. Upgrade mlflow to 3.17.0 and anthropic to
+  1.1.0 (the autolog-supported range).
+- Add registry, promotion and tracing tests (33 total), make models and
+  make mlflow-ui targets, README section.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Y6SwaJhxtx1cdCeJNfWRC5
+---
+ Dockerfile               |   3 +-
+ Makefile                 |  10 ++-
+ README.md                |  41 +++++++---
+ agent/orchestrator.py    |  42 +++++++++-
+ agent/tools.py           |  34 +++++++-
+ agent/tracing.py         |  63 +++++++++++++++
+ app/main.py              |  11 ++-
+ app/registry.py          | 167 ++++++++++++++++++++++++++++-----------
+ app/static/index.html    |   4 +-
+ ml/benchmark_parallel.py |  14 ++--
+ ml/mlflow_config.py      |  61 ++++++++++++++
+ ml/promote.py            | 105 ++++++++++++++++++++++++
+ ml/train.py              | 141 ++++++++++++++++-----------------
+ pytest.ini               |   2 +
+ requirements.txt         |   4 +-
+ tests/conftest.py        |   3 +
+ tests/test_agent.py      |  29 +++++++
+ tests/test_api.py        |   2 +
+ tests/test_registry.py   |  80 +++++++++++++++++++
+ 19 files changed, 659 insertions(+), 157 deletions(-)
+ create mode 100644 agent/tracing.py
+ create mode 100644 ml/mlflow_config.py
+ create mode 100644 ml/promote.py
+ create mode 100644 tests/test_registry.py
+
+diff --git a/Dockerfile b/Dockerfile
+index 637f2ae..03fe8e2 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -26,8 +26,7 @@ ARG GIT_COMMIT=unknown
+ ENV GIT_COMMIT=${GIT_COMMIT}
+ RUN python -m ml.data_generation \
+     && python -m ml.train \
+-    && python -m ml.vector_store \
+-    && rm -rf mlruns
++    && python -m ml.vector_store
+ 
+ # Hugging Face Spaces runs containers as uid 1000; Render/Fly set $PORT.
+ RUN useradd -m -u 1000 appuser && chown -R appuser /app
+diff --git a/Makefile b/Makefile
+index d284756..4e61d8e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ PY ?= python
+ 
+-.PHONY: install data train index pipeline test lint regress baseline bench serve docker
++.PHONY: install data train index pipeline test lint regress baseline bench serve docker mlflow-ui models
+ 
+ install:
+ 	$(PY) -m pip install -r requirements-dev.txt
+@@ -8,7 +8,7 @@ install:
+ data:
+ 	$(PY) -m ml.data_generation
+ 
+-train:
++train:                        ## train, log to MLflow, register; promote to @champion if not worse
+ 	$(PY) -m ml.train
+ 
+ index:
+@@ -32,6 +32,12 @@ baseline:                     ## accept current numbers as the new baseline
+ bench:
+ 	$(PY) -m ml.benchmark_parallel
+ 
++models:                       ## registry versions per model; * marks @champion
++	$(PY) -m ml.promote
++
++mlflow-ui:                    ## runs, registered models and agent traces at http://localhost:5000
++	$(PY) -m mlflow ui --backend-store-uri sqlite:///ml/artifacts/mlflow/mlflow.db --port 5000
++
+ serve:
+ 	$(PY) -m uvicorn app.main:app --reload --port 8000
+ 
+diff --git a/README.md b/README.md
+index 0d52521..6914da4 100644
+--- a/README.md
++++ b/README.md
+@@ -30,13 +30,14 @@ flowchart LR
+ 
+     subgraph Offline [Training pipeline]
+       D[(Seeded telemetry<br/>+ maintenance logs)] --> T[train.py]
+-      T --> ML[MLflow runs]
+-      T --> R[(Model registry<br/>versioned + metadata)]
+-      D -. DVC .-> R
++      T --> ML[MLflow runs<br/>params, metrics, signatures]
++      ML --> R[(MLflow Model Registry<br/>versions + @champion)]
++      D -. DVC .-> T
+     end
+ 
+-    R --> EP & AD & F1
++    R -->|"@champion, signature checked"| EP & AD & F1
+     SSE[SSE live stream] --> AD
++    AG -. every question .-> TR[(MLflow traces)]
+ ```
+ 
+ Anomaly detection is **two-stage**. A regressor learns what a *healthy* site should produce given weather and sensor inputs. A classifier then works on the residual (actual minus expected) together with drift and vibration features. This structure is what lets the system separate real faults from **grid curtailment**, where output is low on purpose. A naive "power dropped" rule can't make that distinction.
+@@ -64,24 +65,25 @@ The regression check caught the latency problem and a real agent-routing bug ("h
+ 
+ | Responsibility | Where it lives |
+ |---|---|
+-| Integrate ML into production pipelines and APIs | `app/` FastAPI service; models load once at startup through a registry |
++| Integrate ML into production pipelines and APIs | `app/` FastAPI service; models load once at startup from the MLflow Model Registry (`@champion`), after a signature check |
+ | Optimize latency, throughput, memory | Measured latency fix above; `ml/benchmark_parallel.py` (naive vs vectorized vs process pool, results asserted identical) |
+ | Model-serving infrastructure (API, batch, streaming) | REST endpoints, `/predict/batch`, and **SSE `/stream/telemetry`** running live per-event inference |
+-| Testing and validation frameworks for ML | `tests/`: feature-skew, leakage, API-contract and agent tests (25) |
+-| Caching and provenance for models, code and data | Redis/in-process prediction cache; **DVC** for data and artifacts; registry `metadata.json` per model version (data hash, git commit, features, metrics); **MLflow** for runs |
++| Testing and validation frameworks for ML | `tests/`: feature-skew, leakage, API-contract, registry/promotion, agent and tracing tests (33) |
++| Caching and provenance for models, code and data | Redis/in-process prediction cache; **DVC** for data and artifacts; **MLflow** runs tagged with data hash and git commit, models logged with signatures, `/health` reports which registry version and run each served model came from |
+ | CI/CD for model deployment | `.github/workflows/ci.yml`: rebuild from source, then tests, then regression gate, then image build and container smoke test, then deploy |
+ | Regression testing to monitor the analytics engine | `ml/regression_check.py`: quality, p95 latency, agent-routing accuracy and data contract against a committed baseline, with run history for trends |
+ | Vector DBs / embeddings | FAISS index behind an `Embedder` interface (see the honest note below) |
+-| Agent layer integration | `agent/`: Anthropic tool-use loop, plus a deterministic fallback that calls the *same* tools |
++| Agent layer integration | `agent/`: Anthropic tool-use loop, plus a deterministic fallback that calls the *same* tools; every question is an **MLflow trace** |
+ 
+ ## Run it
+ 
+ ```bash
+ make install         # pip install -r requirements-dev.txt
+ make pipeline        # generate seeded data -> train (MLflow) -> build vector index
+-make test            # 25 tests
++make test            # 33 tests
+ make regress         # regression gate vs ml/regression_baseline.json
+ make serve           # http://localhost:8000  (UI at /, API docs at /docs)
++make mlflow-ui       # http://localhost:5000  (runs, registered models, agent traces)
+ ```
+ 
+ With Docker (adds Redis as the shared cache):
+@@ -92,6 +94,19 @@ docker compose up --build    # http://localhost:8000
+ 
+ To run the agent in **LLM tool-use mode**, set `ANTHROPIC_API_KEY`. Without a key it falls back to a deterministic rule-based planner over the same tools, which keeps it fully runnable offline and testable in CI.
+ 
++## MLflow: signatures, registry and agent traces
++
++- **Signatures.** Every model is logged with its input schema (column names and types) and an input example. At startup the service compares each model's signature with the feature columns it computes and refuses to start on a mismatch, so a model trained on different columns can't be served by accident.
++- **Model Registry.** Each `make train` registers a new version of all three models. A new version is moved to the `@champion` alias only if its primary metric (MAE, or F1 for the detector) is at least as good as the current champion's; otherwise it stays registered, tagged with the reason. The service loads `@champion`.
++
++  ```bash
++  make models                                # versions per model, * = champion
++  python -m ml.promote anomaly_detector 1    # rollback: point @champion at v1, then restart
++  ```
++- **Agent tracing.** Every `/agent/query` is recorded as one trace: the question, the routing decision or each Claude call (prompt, tool choice, tokens, errors), every tool call with full inputs and outputs, and the answer. Traces are tagged with the mode and the model versions that served them. The response includes `trace_id`, which the UI shows. Set `PLANTPULSE_TRACING=0` to turn it off.
++
++Storage is a local SQLite store under `ml/artifacts/mlflow/`. It records absolute artifact paths, so on a new machine regenerate it with `make pipeline`, or set `MLFLOW_TRACKING_URI` to a shared MLflow server.
++
+ ## Deploy (free public URL)
+ 
+ **Hugging Face Spaces (recommended: 16 GB RAM on the free CPU tier):**
+@@ -106,7 +121,7 @@ To run the agent in **LLM tool-use mode**, set `ANTHROPIC_API_KEY`. Without a ke
+ - **Synthetic data.** The telemetry is generated with physically motivated power curves and seeded, injected faults (inverter faults, sensor drift, mechanical wear) plus benign curtailment. Seeding makes the whole pipeline reproducible: a cold rebuild in CI yields bit-identical metrics, which the regression gate verifies.
+ - **Embeddings.** The sandbox this was built in blocked model downloads, so the default embedder is TF-IDF plus truncated SVD (offline and deterministic). A neural embedder (`FastEmbedEmbedder`, bge-small) sits behind the same interface and is a one-line swap.
+ - **Features are precomputed at startup** as a stand-in for a streaming feature pipeline. The serving contract (the model is called at request time, one row per request) is real. In production I'd move feature computation into a streaming job and an online feature store.
+-- **The LLM agent path** is implemented against Anthropic's tool-use API but isn't exercised in CI, which runs without credentials. The rule-based path calls the same tool functions and is fully tested.
++- **The LLM agent path** is implemented against Anthropic's tool-use API but isn't exercised in CI, which runs without credentials. The rule-based path calls the same tool functions and is fully tested. When a Claude call fails, the trace shows the failed call next to the fallback that answered instead.
+ - **Parallelism.** On a 2-core runner, vectorization is the lever that matters, and the process pool adds only about 14%. The benchmark exists to *measure* that rather than assume parallelism helps.
+ 
+ ## Roadmap
+@@ -116,9 +131,9 @@ Multi-horizon forecasts with prediction intervals · drift monitoring on live fe
+ ## Layout
+ 
+ ```
+-app/       FastAPI service: registry, cache, inference, SSE stream, UI
+-agent/     tool specs + orchestrator (Anthropic tool-use / rule-based fallback)
+-ml/        data generation, features, training, vector store, benchmark, regression gate
++app/       FastAPI service: registry loader, cache, inference, SSE stream, UI
++agent/     tool specs, orchestrator (Anthropic tool-use / rule-based fallback), tracing
++ml/        data generation, features, training + MLflow registry/promotion, vector store, benchmark, regression gate
+ tests/     feature, API-contract and agent tests
+ infra/     deployment helpers
+ ```
+diff --git a/agent/orchestrator.py b/agent/orchestrator.py
+index 06e248d..df4e901 100644
+--- a/agent/orchestrator.py
++++ b/agent/orchestrator.py
+@@ -17,7 +17,11 @@ Two modes, same underlying tools (agent/tools.py):
+     so the service and its tests are fully runnable with zero external
+     dependencies. This is the mode exercised below and in CI.
+ 
+-Both paths return the same response shape: {"answer": str, "tool_calls": [...]}.
++Both paths return the same response shape:
++{"answer": str, "tool_calls": [...], "mode": "llm" | "rule_based", "trace_id": str}.
++
++Each question is recorded as one MLflow trace (see agent/tracing.py); the
++response's trace_id opens it in the MLflow UI.
+ """
+ 
+ from __future__ import annotations
+@@ -26,7 +30,11 @@ import os
+ import re
+ from typing import Any, cast
+ 
++import mlflow
++from mlflow.entities import SpanType
++
+ from agent.tools import TOOL_SPECS, dispatch
++from agent.tracing import ensure_tracing, tracing_enabled
+ from app.state import AppState
+ 
+ AgentAnswer = dict[str, Any]
+@@ -65,8 +73,11 @@ def extract_intents(question: str) -> list[str]:
+ 
+ def _rule_based_answer(state: AppState, question: str) -> AgentAnswer:
+     known_sites = [s["site_id"] for s in state.sites]
+-    site_ids = extract_site_ids(question, known_sites)
+-    intents = extract_intents(question)
++    with mlflow.start_span(name="route_question", span_type=SpanType.CHAIN) as span:
++        span.set_inputs({"question": question, "known_sites": known_sites})
++        site_ids = extract_site_ids(question, known_sites)
++        intents = extract_intents(question)
++        span.set_outputs({"site_ids": site_ids, "intents": intents})
+ 
+     tool_calls: list[dict[str, Any]] = []
+     parts: list[str] = []
+@@ -173,7 +184,7 @@ def _llm_answer(state: AppState, question: str, api_key: str) -> AgentAnswer:
+     return {"answer": "(agent loop exceeded max turns without a final answer)", "tool_calls": tool_calls, "mode": "llm"}
+ 
+ 
+-def answer_question(state: AppState, question: str) -> AgentAnswer:
++def _answer(state: AppState, question: str) -> AgentAnswer:
+     api_key = os.environ.get("ANTHROPIC_API_KEY")
+     if api_key:
+         import anthropic
+@@ -185,3 +196,26 @@ def answer_question(state: AppState, question: str) -> AgentAnswer:
+             fallback["llm_error"] = str(exc)
+             return fallback
+     return _rule_based_answer(state, question)
++
++
++def answer_question(state: AppState, question: str) -> AgentAnswer:
++    ensure_tracing()
++    with mlflow.start_span(name="agent_query", span_type=SpanType.AGENT) as span:
++        span.set_inputs({"question": question})
++        result = _answer(state, question)
++        span.set_outputs({"answer": result["answer"], "mode": result["mode"]})
++        span.set_attribute("tool_call_count", len(result["tool_calls"]))
++        if "llm_error" in result:
++            span.set_attribute("llm_error", result["llm_error"])
++        trace_id = span.trace_id
++        if tracing_enabled():
++            # Searchable in the MLflow UI: which mode answered, with which model versions.
++            mlflow.update_current_trace(
++                tags={
++                    "agent.mode": result["mode"],
++                    **{f"model.{k}": v for k, v in state.registry.versions().items()},
++                }
++            )
++    if tracing_enabled():
++        result["trace_id"] = trace_id
++    return result
+diff --git a/agent/tools.py b/agent/tools.py
+index 833c18f..df3c668 100644
+--- a/agent/tools.py
++++ b/agent/tools.py
+@@ -8,12 +8,15 @@ One set of underlying functions, two ways of deciding when to call them.
+ 
+ from __future__ import annotations
+ 
+-from typing import Any
++from typing import Any, cast
+ 
++import mlflow
+ from anthropic.types import ToolParam
++from mlflow.entities import Document, SpanType
+ 
+ from app.inference import NotEnoughData, predict_anomaly, predict_forecast, search_logs
+ from app.state import AppState
++from ml.vector_store import SearchHit
+ 
+ TOOL_SPECS: list[ToolParam] = [
+     {
+@@ -64,7 +67,7 @@ TOOL_SPECS: list[ToolParam] = [
+ ]
+ 
+ 
+-def dispatch(state: AppState, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
++def _run_tool(state: AppState, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+     try:
+         if tool_name == "check_anomaly":
+             return predict_anomaly(state, tool_input["site_id"], tool_input.get("as_of"))
+@@ -75,3 +78,30 @@ def dispatch(state: AppState, tool_name: str, tool_input: dict[str, Any]) -> dic
+         return {"error": f"unknown tool {tool_name!r}"}
+     except NotEnoughData as exc:
+         return {"error": str(exc)}
++
++
++def _as_documents(hits: list[SearchHit]) -> list[dict[str, Any]]:
++    """Retrieved logs in MLflow's Document shape, so the trace UI renders them as sources."""
++    return [
++        Document(
++            page_content=h["text"],
++            metadata={"site_id": h["site_id"], "event_type": h["event_type"], "date": h["date"], "score": h["score"]},
++            id=h["log_id"],
++        ).to_dict()
++        for h in hits
++    ]
++
++
++def dispatch(state: AppState, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
++    """Run one tool inside its own trace span, recording the full input and output."""
++    is_retrieval = tool_name == "search_maintenance_logs"
++    with mlflow.start_span(name=tool_name, span_type=SpanType.RETRIEVER if is_retrieval else SpanType.TOOL) as span:
++        span.set_inputs(tool_input)
++        result = _run_tool(state, tool_name, tool_input)
++        if is_retrieval and "results" in result:
++            span.set_outputs(_as_documents(cast(list[SearchHit], result["results"])))
++        else:
++            span.set_outputs(result)
++        if "error" in result:
++            span.set_attribute("tool_error", result["error"])
++    return result
+diff --git a/agent/tracing.py b/agent/tracing.py
+new file mode 100644
+index 0000000..19e5cc7
+--- /dev/null
++++ b/agent/tracing.py
+@@ -0,0 +1,63 @@
++"""
++MLflow Tracing for the agent.
++
++Every /agent/query becomes one trace in the `plantpulse-agent` experiment:
++
++    agent_query (AGENT)                 question in, answer + mode out
++    ├── route_question (CHAIN)          rule-based mode: sites + intents picked
++    ├── Messages.create (CHAT_MODEL)    LLM mode: one span per Claude call, from
++    │                                   mlflow.anthropic.autolog (prompt, tool
++    │                                   choices, token usage, errors)
++    └── check_anomaly / forecast_power (TOOL), search_maintenance_logs (RETRIEVER)
++                                        full tool inputs and outputs
++
++so "why did the agent answer that?" is answered by opening the trace in the
++MLflow UI (`make mlflow-ui`, Traces tab) instead of re-running the question.
++
++Traces are written asynchronously, so a request doesn't wait on the database.
++Set PLANTPULSE_TRACING=0 to turn tracing off.
++"""
++
++from __future__ import annotations
++
++import os
++import threading
++
++import mlflow
++from mlflow.anthropic import autolog as anthropic_autolog
++from mlflow.config import enable_async_logging
++from mlflow.tracing import disable as disable_tracing
++from mlflow.tracing import enable as enable_tracing
++
++from ml.mlflow_config import agent_experiment, use_experiment
++
++_lock = threading.Lock()
++_configured = False
++
++
++def tracing_enabled() -> bool:
++    return os.environ.get("PLANTPULSE_TRACING", "1") != "0"
++
++
++def ensure_tracing() -> None:
++    """Point traces at the agent experiment and patch the Anthropic client (idempotent)."""
++    global _configured
++    if _configured:
++        return
++    with _lock:
++        if _configured:
++            return
++        if tracing_enabled():
++            use_experiment(agent_experiment())
++            enable_async_logging(True)
++            anthropic_autolog(silent=True)
++            enable_tracing()
++        else:
++            disable_tracing()
++        _configured = True
++
++
++def flush_traces() -> None:
++    """Write out traces still queued by async logging (call on shutdown)."""
++    if _configured and tracing_enabled():
++        mlflow.flush_trace_async_logging()
+diff --git a/app/main.py b/app/main.py
+index ae59229..04812c8 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException
+ from fastapi.responses import FileResponse
+ from sse_starlette.sse import EventSourceResponse
+ 
++from agent.tracing import ensure_tracing, flush_traces, tracing_enabled
+ from app.inference import (
+     NotEnoughData,
+     Prediction,
+@@ -47,7 +48,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+     _state = AppState()
+     print(f"[startup] models loaded: {_state.registry.versions()}")
+     print(f"[startup] sites: {[s['site_id'] for s in _state.sites]}")
++    ensure_tracing()
++    print(f"[startup] agent tracing: {'on' if tracing_enabled() else 'off'}")
+     yield
++    flush_traces()
+ 
+ 
+ app = FastAPI(title="PlantPulse", version="0.1.0", lifespan=lifespan)
+@@ -70,7 +74,12 @@ def index() -> FileResponse:
+ @app.get("/health")
+ def health() -> dict[str, Any]:
+     state = get_state()
+-    return {"status": "ok", "model_versions": state.registry.versions(), "cache": state.cache.stats()}
++    return {
++        "status": "ok",
++        "model_versions": state.registry.versions(),
++        "models": state.registry.describe(),
++        "cache": state.cache.stats(),
++    }
+ 
+ 
+ @app.get("/sites")
+diff --git a/app/registry.py b/app/registry.py
+index 178a5e1..0a48ffc 100644
+--- a/app/registry.py
++++ b/app/registry.py
+@@ -1,23 +1,41 @@
+ """
+-Minimal model registry reader: resolves the "current" version of each
+-model (as published by ml/train.py's registry writer) and loads it once,
+-at process startup, so a request never pays model-load cost.
++Model loading from the MLflow Model Registry.
++
++At process startup the service resolves each model's `@champion` alias to a
++concrete registry version, checks the version's logged signature against the
++feature columns this code computes, and loads it once - so a request never
++pays model-load cost, and a model trained on different columns can't be
++served by accident.
++
++Rollback is moving the alias (`python -m ml.promote <model> <version>`) and
++restarting; no files are copied around.
+ """
+ 
+ from __future__ import annotations
+ 
+-import json
+ from pathlib import Path
+ from typing import Any, Generic, Protocol, TypeVar, cast
+ 
+-import joblib
++import mlflow.artifacts
+ import numpy as np
+ import pandas as pd
++from mlflow import MlflowClient
++from mlflow.exceptions import MlflowException
++from mlflow.models import get_model_info
++from mlflow.sklearn import load_model
+ from numpy.typing import NDArray
+-from typing_extensions import TypedDict  # pydantic needs this on Python < 3.12
++
++from ml.features import ANOMALY_FEATURES, EXPECTED_POWER_FEATURES, FORECAST_FEATURES
++from ml.mlflow_config import CHAMPION_ALIAS, REGISTERED_NAMES, configure_tracking
+ 
+ ROOT = Path(__file__).resolve().parent.parent
+-ARTIFACTS_DIR = ROOT / "ml" / "artifacts"
++
++# The input columns each model must have been trained on, in order.
++EXPECTED_INPUTS: dict[str, list[str]] = {
++    "expected_power": EXPECTED_POWER_FEATURES,
++    "anomaly_detector": ANOMALY_FEATURES,
++    "forecaster_1h": FORECAST_FEATURES,
++}
+ 
+ 
+ class Estimator(Protocol):
+@@ -36,70 +54,123 @@ class Classifier(Estimator, Protocol):
+     def predict_proba(self, X: pd.DataFrame) -> NDArray[np.float64]: ...
+ 
+ 
+-class ModelMetadata(TypedDict):
+-    model_name: str
+-    version: str
+-    trained_at: str
+-    git_commit: str
+-    data_file: str
+-    data_sha256_16: str
+-    features: list[str]
+-    metrics: dict[str, float]
+-    params: dict[str, Any]
+-
+-
+-class RegistryPointer(TypedDict):
+-    version: str
+-    path: str
++class ModelContractError(RuntimeError):
++    """The registered model can't be served by this version of the code."""
+ 
+ 
+ M = TypeVar("M", bound=Estimator)
+ 
+ 
+ class LoadedModel(Generic[M]):
+-    def __init__(self, name: str, model: M, metadata: ModelMetadata) -> None:
+-        self.name = name
++    def __init__(
++        self,
++        key: str,
++        model: M,
++        registry_version: str,
++        run_id: str,
++        features: list[str],
++        metrics: dict[str, float],
++        tags: dict[str, str],
++    ) -> None:
++        self.key = key
++        self.name = REGISTERED_NAMES[key]
+         self.model = model
+-        self.metadata = metadata
++        self.registry_version = registry_version
++        self.run_id = run_id
++        self.features = features
++        self.metrics = metrics
++        self.tags = tags
+ 
+     @property
+     def version(self) -> str:
+-        return self.metadata["version"]
++        return f"v{self.registry_version}"
+ 
+     @property
+-    def features(self) -> list[str]:
+-        return self.metadata["features"]
+-
+-
+-def resolve_current(model_name: str) -> Path:
+-    """Directory of the version that `current.json` marks as live."""
+-    pointer = cast(RegistryPointer, json.loads((ARTIFACTS_DIR / model_name / "current.json").read_text()))
+-    return ROOT / pointer["path"]
+-
+-
+-def load_current(model_name: str, kind: type[M]) -> LoadedModel[M]:
+-    version_dir = resolve_current(model_name)
+-
+-    model = cast(Estimator, joblib.load(version_dir / "model.joblib"))
++    def uri(self) -> str:
++        """Pinned to the resolved version, so it stays valid if the alias moves."""
++        return f"models:/{self.name}/{self.registry_version}"
++
++
++def _signature_inputs(model_uri: str) -> list[str]:
++    signature = get_model_info(model_uri).signature
++    if signature is None:
++        raise ModelContractError(f"{model_uri} was logged without a signature")
++    return list(signature.inputs.input_names())
++
++
++def load_champion(model_key: str, kind: type[M]) -> LoadedModel[M]:
++    """Load the version `@champion` points at, after checking its input contract."""
++    configure_tracking()
++    client = MlflowClient()
++    name = REGISTERED_NAMES[model_key]
++    try:
++        mv = client.get_model_version_by_alias(name, CHAMPION_ALIAS)
++    except MlflowException as exc:
++        raise ModelContractError(
++            f"no {name}@{CHAMPION_ALIAS} in the registry - run `make train` first"
++        ) from exc
++
++    model_uri = f"models:/{name}/{mv.version}"
++    expected = EXPECTED_INPUTS[model_key]
++    logged = _signature_inputs(model_uri)
++    if logged != expected:
++        raise ModelContractError(
++            f"{name} v{mv.version} expects inputs {logged}, but the service computes {expected}. "
++            "Retrain, or point @champion at a compatible version."
++        )
++
++    model = cast(Estimator, load_model(model_uri))
+     # Online inference scores one row at a time; fanning a single row out across
+     # threads (n_jobs=-1, the training setting) costs far more than it saves.
+     if "n_jobs" in model.get_params():
+         model.set_params(n_jobs=1)
+-    metadata = cast(ModelMetadata, json.loads((version_dir / "metadata.json").read_text()))
+-    return LoadedModel(model_name, cast(M, model), metadata)
++
++    run_id = mv.run_id or ""
++    run_data = client.get_run(run_id).data if run_id else None
++    return LoadedModel(
++        model_key,
++        cast(M, model),
++        registry_version=str(mv.version),
++        run_id=run_id,
++        features=logged,
++        metrics=dict(run_data.metrics) if run_data else {},
++        tags={k: v for k, v in run_data.tags.items() if not k.startswith("mlflow.")} if run_data else {},
++    )
++
++
++def champion_local_path(model_key: str) -> str:
++    """Local directory of the champion's MLflow model, for loading in worker processes."""
++    configure_tracking()
++    name = REGISTERED_NAMES[model_key]
++    mv = MlflowClient().get_model_version_by_alias(name, CHAMPION_ALIAS)
++    return mlflow.artifacts.download_artifacts(artifact_uri=f"models:/{name}/{mv.version}")
+ 
+ 
+ class ModelRegistry:
+     """Loads every production model once; holds them for the app's lifetime."""
+ 
+     def __init__(self) -> None:
+-        self.expected_power = load_current("expected_power", Regressor)
+-        self.anomaly_detector = load_current("anomaly_detector", Classifier)
+-        self.forecaster = load_current("forecaster_1h", Regressor)
++        self.expected_power = load_champion("expected_power", Regressor)
++        self.anomaly_detector = load_champion("anomaly_detector", Classifier)
++        self.forecaster = load_champion("forecaster_1h", Regressor)
++
++    def _all(self) -> list[LoadedModel[Any]]:
++        return [self.expected_power, self.anomaly_detector, self.forecaster]
+ 
+     def versions(self) -> dict[str, str]:
++        return {m.key: m.version for m in self._all()}
++
++    def describe(self) -> dict[str, dict[str, Any]]:
++        """Provenance for /health: which registry version, run and data each model came from."""
+         return {
+-            "expected_power": self.expected_power.version,
+-            "anomaly_detector": self.anomaly_detector.version,
+-            "forecaster_1h": self.forecaster.version,
++            m.key: {
++                "registered_model": m.name,
++                "version": m.version,
++                "alias": CHAMPION_ALIAS,
++                "run_id": m.run_id,
++                "git_commit": m.tags.get("git_commit"),
++                "data_sha256_16": m.tags.get("data_sha256_16"),
++                "metrics": m.metrics,
++            }
++            for m in self._all()
+         }
+diff --git a/app/static/index.html b/app/static/index.html
+index 93ebae4..16d1f96 100644
+--- a/app/static/index.html
++++ b/app/static/index.html
+@@ -160,7 +160,9 @@ $("ask").onsubmit = async (e) => {
+   $("answer").textContent = res.answer;
+   $("traceBody").textContent = JSON.stringify(res.tool_calls, null, 2);
+   $("trace").hidden = false;
+-  $("trace").querySelector("summary").textContent = `Tool calls (${res.tool_calls.length}, mode: ${res.mode})`;
++  const traceRef = res.trace_id ? ` · MLflow trace ${res.trace_id}` : "";
++  $("trace").querySelector("summary").textContent =
++    `Tool calls (${res.tool_calls.length}, mode: ${res.mode}${res.llm_error ? ", LLM failed - fell back" : ""})${traceRef}`;
+ };
+ 
+ for (const ex of EXAMPLES) {
+diff --git a/ml/benchmark_parallel.py b/ml/benchmark_parallel.py
+index 827c01d..dd4e0a9 100644
+--- a/ml/benchmark_parallel.py
++++ b/ml/benchmark_parallel.py
+@@ -27,12 +27,12 @@ from collections.abc import Callable
+ from concurrent.futures import ProcessPoolExecutor
+ from typing import Any, ParamSpec, TypeVar, cast
+ 
+-import joblib
+ import numpy as np
+ import pandas as pd
++from mlflow.sklearn import load_model
+ from numpy.typing import NDArray
+ 
+-from app.registry import ROOT, Classifier, Regressor, load_current, resolve_current
++from app.registry import ROOT, Classifier, Regressor, champion_local_path, load_champion
+ from ml.features import (
+     ANOMALY_FEATURES,
+     EXPECTED_POWER_FEATURES,
+@@ -53,7 +53,7 @@ _worker_model: Classifier | None = None
+ 
+ def _init_worker(model_path: str) -> None:
+     global _worker_model
+-    model = cast(Classifier, joblib.load(model_path))
++    model = cast(Classifier, load_model(model_path))
+     model.set_params(n_jobs=1)  # one core per worker; the pool provides the parallelism
+     _worker_model = model
+ 
+@@ -93,14 +93,14 @@ def _timed(fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> tuple[R, fl
+ def main() -> None:
+     raw = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
+     df = add_expected_power_features(raw)
+-    expected = load_current("expected_power", Regressor).model.predict(df[EXPECTED_POWER_FEATURES])
++    expected = load_champion("expected_power", Regressor).model.predict(df[EXPECTED_POWER_FEATURES])
+     df = add_anomaly_features(df, expected)
+     feat = df[ANOMALY_FEATURES].astype("float64")
+ 
+-    detector = load_current("anomaly_detector", Classifier)
+-    model_path = str(resolve_current("anomaly_detector") / "model.joblib")
++    detector = load_champion("anomaly_detector", Classifier)
++    model_path = champion_local_path("anomaly_detector")  # workers load from local disk
+ 
+-    # load_current already pins n_jobs=1, so "vectorized" is honestly single-core
++    # load_champion already pins n_jobs=1, so "vectorized" is honestly single-core
+     # and the parallel comparison measures process-level scaling, not the
+     # forest's own threading.
+ 
+diff --git a/ml/mlflow_config.py b/ml/mlflow_config.py
+new file mode 100644
+index 0000000..bed97ba
+--- /dev/null
++++ b/ml/mlflow_config.py
+@@ -0,0 +1,61 @@
++"""
++Single place for MLflow settings shared by training, serving and the agent.
++
++Storage defaults to a local SQLite tracking store under ml/artifacts/mlflow/
++(DVC-tracked with the rest of ml/artifacts). Set MLFLOW_TRACKING_URI to point
++at a shared MLflow server instead - nothing else needs to change.
++
++View runs, registered models and agent traces with:
++    make mlflow-ui      # http://localhost:5000
++"""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++import mlflow
++
++ROOT = Path(__file__).resolve().parent.parent
++MLFLOW_DIR = ROOT / "ml" / "artifacts" / "mlflow"
++ARTIFACT_ROOT = MLFLOW_DIR / "artifacts"
++
++TRAINING_EXPERIMENT = "plantpulse-training"
++AGENT_EXPERIMENT = "plantpulse-agent"
++
++# Registry name for each model the service serves.
++REGISTERED_NAMES: dict[str, str] = {
++    "expected_power": "plantpulse-expected-power",
++    "anomaly_detector": "plantpulse-anomaly-detector",
++    "forecaster_1h": "plantpulse-forecaster-1h",
++}
++CHAMPION_ALIAS = "champion"
++
++
++def tracking_uri() -> str:
++    return os.environ.get("MLFLOW_TRACKING_URI") or f"sqlite:///{MLFLOW_DIR / 'mlflow.db'}"
++
++
++def configure_tracking() -> None:
++    """Point this process at the tracking store (and model registry)."""
++    MLFLOW_DIR.mkdir(parents=True, exist_ok=True)
++    mlflow.set_tracking_uri(tracking_uri())
++
++
++def use_experiment(name: str) -> None:
++    """Select an experiment, creating it with a fixed artifact root on first use.
++
++    The artifact root is set explicitly because a SQLite store would otherwise
++    default to ./mlruns relative to whatever directory the process started in.
++    """
++    configure_tracking()
++    if mlflow.get_experiment_by_name(name) is None:
++        ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
++        mlflow.create_experiment(name, artifact_location=ARTIFACT_ROOT.as_uri())
++    mlflow.set_experiment(name)
++
++
++def agent_experiment() -> str:
++    """Experiment that receives agent traces (tests point it elsewhere)."""
++    return os.environ.get("PLANTPULSE_AGENT_EXPERIMENT", AGENT_EXPERIMENT)
++
+diff --git a/ml/promote.py b/ml/promote.py
+new file mode 100644
+index 0000000..1f07a89
+--- /dev/null
++++ b/ml/promote.py
+@@ -0,0 +1,105 @@
++"""
++Champion/challenger promotion for the MLflow Model Registry.
++
++Every training run registers a new version of each model. A new version
++only becomes the `@champion` the service loads if its primary metric is
++at least as good as the current champion's; otherwise it stays registered
++but unpromoted, tagged with the reason.
++
++CLI:
++    python -m ml.promote                        # list versions; * marks the champion
++    python -m ml.promote anomaly_detector 2     # point @champion at version 2 (rollback)
++"""
++
++from __future__ import annotations
++
++import argparse
++import sys
++
++from mlflow import MlflowClient
++from mlflow.entities.model_registry import ModelVersion
++from mlflow.exceptions import MlflowException
++
++from ml.mlflow_config import CHAMPION_ALIAS, REGISTERED_NAMES, configure_tracking
++
++# model key -> (primary metric, higher is better)
++PRIMARY_METRICS: dict[str, tuple[str, bool]] = {
++    "expected_power": ("mae_kw", False),
++    "anomaly_detector": ("f1", True),
++    "forecaster_1h": ("mae_kw", False),
++}
++
++
++def current_champion(client: MlflowClient, model_key: str) -> ModelVersion | None:
++    try:
++        return client.get_model_version_by_alias(REGISTERED_NAMES[model_key], CHAMPION_ALIAS)
++    except MlflowException:  # no champion yet
++        return None
++
++
++def _metric(client: MlflowClient, version: ModelVersion, metric: str) -> float:
++    run_id = version.run_id
++    if run_id is None:
++        raise RuntimeError(f"model version {version.version} has no source run")
++    return float(client.get_run(run_id).data.metrics[metric])
++
++
++def promote_if_not_worse(client: MlflowClient, model_key: str, new_version: str) -> bool:
++    name = REGISTERED_NAMES[model_key]
++    metric, higher_is_better = PRIMARY_METRICS[model_key]
++    candidate = client.get_model_version(name, new_version)
++    candidate_value = _metric(client, candidate, metric)
++
++    champion = current_champion(client, model_key)
++    if champion is None:
++        promote, reason = True, "first version"
++    else:
++        champion_value = _metric(client, champion, metric)
++        promote = (
++            candidate_value >= champion_value if higher_is_better else candidate_value <= champion_value
++        )
++        reason = f"{metric} {candidate_value:g} vs champion v{champion.version} {champion_value:g}"
++
++    if promote:
++        client.set_registered_model_alias(name, CHAMPION_ALIAS, new_version)
++    client.set_model_version_tag(name, new_version, "promotion", ("promoted: " if promote else "rejected: ") + reason)
++    print(f"[registry] {name} v{new_version}: {'promoted to @champion' if promote else 'kept as challenger'} ({reason})")
++    return promote
++
++
++def list_versions(client: MlflowClient) -> None:
++    for model_key, name in REGISTERED_NAMES.items():
++        champion = current_champion(client, model_key)
++        champion_version = champion.version if champion else None
++        metric, _ = PRIMARY_METRICS[model_key]
++        print(f"{model_key}  ({name}, primary metric: {metric})")
++        versions = sorted(client.search_model_versions(f"name='{name}'"), key=lambda v: int(v.version))
++        for v in versions:
++            marker = "*" if v.version == champion_version else " "
++            value = _metric(client, v, metric)
++            print(f"  {marker} v{v.version}  {metric}={value:g}  {v.tags.get('promotion', '')}")
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("model", nargs="?", choices=sorted(REGISTERED_NAMES), help="model to re-point")
++    parser.add_argument("version", nargs="?", help="registry version to make @champion")
++    args = parser.parse_args(argv)
++
++    configure_tracking()
++    client = MlflowClient()
++    if args.model is None:
++        list_versions(client)
++        return 0
++    if args.version is None:
++        parser.error("give a version to promote, e.g. `python -m ml.promote anomaly_detector 2`")
++    name = REGISTERED_NAMES[args.model]
++    client.get_model_version(name, args.version)  # fails clearly if the version doesn't exist
++    client.set_registered_model_alias(name, CHAMPION_ALIAS, args.version)
++    client.set_model_version_tag(name, args.version, "promotion", "promoted manually")
++    print(f"{name}@{CHAMPION_ALIAS} -> v{args.version}. Restart the service to load it.")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/ml/train.py b/ml/train.py
+index 4447ad7..8fd47f0 100644
+--- a/ml/train.py
++++ b/ml/train.py
+@@ -1,5 +1,5 @@
+ """
+-Training entrypoint for PlantPulse's two production models:
++Training entrypoint for PlantPulse's three production models:
+ 
+   1. expected_power  - GradientBoostingRegressor, predicts "healthy" power
+                        output given weather/sensor inputs. Used to compute
+@@ -9,36 +9,35 @@ Training entrypoint for PlantPulse's two production models:
+                        against a naive static-threshold baseline so the
+                        lift from the model is an actual measured number,
+                        not an assumption.
+-  3. forecaster       - GradientBoostingRegressor, 1h-ahead power forecast
++  3. forecaster_1h    - GradientBoostingRegressor, 1h-ahead power forecast
+                        from lag/rolling features.
+ 
+-All three runs are logged to MLflow (params, metrics, artifacts). Each
+-trained artifact is also written into a lightweight content-addressed
+-model registry under ml/artifacts/<model_name>/<version>/ with a
+-metadata.json capturing data hash, git commit, features, and metrics -
+-the same provenance contract DVC enforces, plus the raw data file itself
+-is tracked with `dvc add` for dataset-level versioning.
++Each run is logged to MLflow (params, metrics, provenance tags) and the
++model is logged with a signature and input example, then registered in the
++MLflow Model Registry. A new version becomes `@champion` - the version the
++service loads - only if its primary metric is at least as good as the
++current champion's (see ml/promote.py). The raw data file is tracked with
++DVC for dataset-level versioning.
+ 
+ Usage:
+-    python ml/train.py
++    python -m ml.train
+ """
+ 
+ from __future__ import annotations
+ 
+ import hashlib
+-import json
+ import os
+ import subprocess
+-from datetime import UTC, datetime
+ from pathlib import Path
+ from typing import Any
+ 
+-import joblib
+ import mlflow
+ import numpy as np
+ import pandas as pd
++from mlflow import MlflowClient
++from mlflow.models import infer_signature
++from mlflow.sklearn import log_model
+ from numpy.typing import NDArray
+-from sklearn.base import BaseEstimator
+ from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier
+ from sklearn.metrics import (
+     f1_score,
+@@ -56,11 +55,15 @@ from ml.features import (
+     add_expected_power_features,
+     add_forecast_features,
+ )
++from ml.mlflow_config import REGISTERED_NAMES, TRAINING_EXPERIMENT, tracking_uri, use_experiment
++from ml.promote import promote_if_not_worse
+ 
+ ROOT = Path(__file__).resolve().parent.parent
+ DATA_PATH = ROOT / "data" / "telemetry.csv"
+-ARTIFACTS_DIR = ROOT / "ml" / "artifacts"
+-MLFLOW_DIR = ROOT / "mlruns"
++
++# Tree node storage shared by the forests and boosted trees. Trusted because we
++# create these files ourselves in this pipeline.
++SKOPS_TRUSTED_TYPES = ["sklearn.tree._tree.Tree"]
+ 
+ 
+ def _git_commit() -> str:
+@@ -82,37 +85,40 @@ def _sha256(path: Path) -> str:
+     return h.hexdigest()[:16]
+ 
+ 
+-def register_model(
+-    model_name: str,
+-    model_obj: BaseEstimator,
+-    feature_list: list[str],
+-    metrics: dict[str, float],
++def log_and_register(
++    model_key: str,
++    model: GradientBoostingRegressor | RandomForestClassifier,
++    X_example: pd.DataFrame,
+     params: dict[str, Any],
++    metrics: dict[str, float],
+ ) -> str:
+-    version = datetime.now(UTC).strftime("v%Y%m%d_%H%M%S")
+-    out_dir = ARTIFACTS_DIR / model_name / version
+-    out_dir.mkdir(parents=True, exist_ok=True)
+-
+-    joblib.dump(model_obj, out_dir / "model.joblib")
+-    metadata: dict[str, Any] = {
+-        "model_name": model_name,
+-        "version": version,
+-        "trained_at": datetime.now(UTC).isoformat(),
+-        "git_commit": _git_commit(),
+-        "data_file": str(DATA_PATH.relative_to(ROOT)),
+-        "data_sha256_16": _sha256(DATA_PATH),
+-        "features": feature_list,
+-        "metrics": metrics,
+-        "params": params,
+-    }
+-    with open(out_dir / "metadata.json", "w") as f:
+-        json.dump(metadata, f, indent=2)
+-
+-    current_pointer = ARTIFACTS_DIR / model_name / "current.json"
+-    with open(current_pointer, "w") as f:
+-        json.dump({"version": version, "path": str(out_dir.relative_to(ROOT))}, f, indent=2)
+-
+-    print(f"[registry] {model_name} -> {version}  metrics={metrics}")
++    """Log one training run to MLflow and register the model; returns the new version."""
++    with mlflow.start_run(run_name=model_key):
++        mlflow.log_params(params)
++        mlflow.log_metrics(metrics)
++        mlflow.set_tags({
++            "git_commit": _git_commit(),
++            "data_file": str(DATA_PATH.relative_to(ROOT)),
++            "data_sha256_16": _sha256(DATA_PATH),
++        })
++        # The signature records the exact input columns and dtypes; the service
++        # checks it against the features it computes before it will start.
++        # Declared as doubles: integer columns (hour, flags) can't hold NaN, and
++        # scikit-learn converts every input to float64 anyway.
++        X_example = X_example.astype("float64")
++        signature = infer_signature(X_example, model.predict(X_example))
++        info = log_model(
++            model,
++            name="model",
++            signature=signature,
++            input_example=X_example.head(3),
++            registered_model_name=REGISTERED_NAMES[model_key],
++            # MLflow saves scikit-learn models with skops rather than pickle, so
++            # loading can't run arbitrary code; only these reviewed types are allowed.
++            skops_trusted_types=SKOPS_TRUSTED_TYPES,
++        )
++    version = str(info.registered_model_version)
++    promote_if_not_worse(MlflowClient(), model_key, version)
+     return version
+ 
+ 
+@@ -135,14 +141,12 @@ def train_expected_power(
+     pred = model.predict(healthy_test[EXPECTED_POWER_FEATURES])
+     mae = mean_absolute_error(healthy_test["power_kw"], pred)
+ 
+-    with mlflow.start_run(run_name="expected_power"):
+-        mlflow.log_params({"n_estimators": 200, "max_depth": 3, "learning_rate": 0.08})
+-        mlflow.log_metric("mae_kw", mae)
+-        mlflow.sklearn.log_model(model, "model")
+-
+     metrics = {"mae_kw": round(float(mae), 3)}
+-    register_model("expected_power", model, EXPECTED_POWER_FEATURES, metrics,
+-                    {"n_estimators": 200, "max_depth": 3, "learning_rate": 0.08})
++    print(f"[eval] expected_power  {metrics}")
++    log_and_register(
++        "expected_power", model, healthy_train[EXPECTED_POWER_FEATURES].head(200),
++        {"n_estimators": 200, "max_depth": 3, "learning_rate": 0.08}, metrics,
++    )
+     return model, metrics
+ 
+ 
+@@ -179,19 +183,11 @@ def train_anomaly_detector(
+         "f1": round(float(f1_score(y_test, naive_pred, zero_division=0)), 3),
+     }
+ 
+-    with mlflow.start_run(run_name="anomaly_detector"):
+-        mlflow.log_params({"n_estimators": 300, "max_depth": 8, "class_weight": "balanced"})
+-        for k, v in model_metrics.items():
+-            mlflow.log_metric(k, v)
+-        for k, v in baseline_metrics.items():
+-            mlflow.log_metric(f"baseline_{k}", v)
+-        mlflow.sklearn.log_model(model, "model")
+-
+     print(f"[eval] anomaly_detector  model={model_metrics}  naive_baseline={baseline_metrics}")
+-    register_model(
+-        "anomaly_detector", model, ANOMALY_FEATURES, model_metrics,
+-        {"n_estimators": 300, "max_depth": 8, "class_weight": "balanced",
+-         "baseline_comparison": baseline_metrics},
++    log_and_register(
++        "anomaly_detector", model, X_train.head(200),
++        {"n_estimators": 300, "max_depth": 8, "class_weight": "balanced"},
++        {**model_metrics, **{f"baseline_{k}": v for k, v in baseline_metrics.items()}},
+     )
+     return model, model_metrics, baseline_metrics
+ 
+@@ -212,22 +208,17 @@ def train_forecaster(
+     naive_pred = test_fc["power_lag_1"]  # persistence baseline: "next = current"
+     naive_mae = mean_absolute_error(test_fc["target_power_kw"], naive_pred)
+ 
+-    with mlflow.start_run(run_name="forecaster_1h"):
+-        mlflow.log_params({"n_estimators": 250, "max_depth": 4, "learning_rate": 0.06, "horizon_steps": 4})
+-        mlflow.log_metric("mae_kw", mae)
+-        mlflow.log_metric("naive_persistence_mae_kw", naive_mae)
+-        mlflow.sklearn.log_model(model, "model")
+-
+     metrics = {"mae_kw": round(float(mae), 3), "naive_persistence_mae_kw": round(float(naive_mae), 3)}
+     print(f"[eval] forecaster_1h  {metrics}")
+-    register_model("forecaster_1h", model, FORECAST_FEATURES, metrics,
+-                    {"n_estimators": 250, "max_depth": 4, "learning_rate": 0.06, "horizon_steps": 4})
++    log_and_register(
++        "forecaster_1h", model, train_fc[FORECAST_FEATURES].head(200),
++        {"n_estimators": 250, "max_depth": 4, "learning_rate": 0.06, "horizon_steps": 4}, metrics,
++    )
+     return model, metrics
+ 
+ 
+ def main() -> None:
+-    mlflow.set_tracking_uri(f"file:{MLFLOW_DIR}")
+-    mlflow.set_experiment("plantpulse")
++    use_experiment(TRAINING_EXPERIMENT)
+ 
+     raw = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
+     df = add_expected_power_features(raw)
+@@ -245,8 +236,8 @@ def main() -> None:
+     train_fc, test_fc = time_split(df_fc)
+     train_forecaster(train_fc, test_fc)
+ 
+-    print("\nAll models trained, evaluated, and registered under ml/artifacts/.")
+-    print("MLflow run data at:", MLFLOW_DIR)
++    print(f"\nAll models trained, evaluated and registered. MLflow store: {tracking_uri()}")
++    print("Browse runs and the registry with: make mlflow-ui")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/pytest.ini b/pytest.ini
+index 7a7ac27..1a30050 100644
+--- a/pytest.ini
++++ b/pytest.ini
+@@ -4,3 +4,5 @@ pythonpath = .
+ asyncio_default_fixture_loop_scope = session
+ filterwarnings =
+     ignore::DeprecationWarning:starlette.*
++    ignore::DeprecationWarning:sqlalchemy.*
++    ignore:.*noload.*
+diff --git a/requirements.txt b/requirements.txt
+index 8485114..435a4c7 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -7,8 +7,8 @@ pandas==2.2.3
+ numpy==1.26.4
+ scikit-learn==1.5.2
+ joblib==1.4.2
+-mlflow==2.19.0
++mlflow==3.17.0
+ faiss-cpu==1.9.0.post1
+ httpx==0.28.1
+-anthropic==0.42.0
++anthropic==1.1.0
+ redis==5.2.1
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 18f65bf..53be5d6 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -16,6 +16,9 @@ def monkeypatch_session() -> Iterator[pytest.MonkeyPatch]:
+     mp = pytest.MonkeyPatch()
+     mp.delenv("ANTHROPIC_API_KEY", raising=False)
+     mp.delenv("REDIS_URL", raising=False)
++    # Keep test traces out of the experiment developers browse.
++    mp.setenv("PLANTPULSE_TRACING", "1")
++    mp.setenv("PLANTPULSE_AGENT_EXPERIMENT", "plantpulse-agent-tests")
+     yield mp
+     mp.undo()
+ 
+diff --git a/tests/test_agent.py b/tests/test_agent.py
+index f075efb..e68ccf4 100644
+--- a/tests/test_agent.py
++++ b/tests/test_agent.py
+@@ -47,3 +47,32 @@ def test_agent_asks_for_a_site_when_none_named(client: TestClient) -> None:
+     body = client.post("/agent/query", json={"question": "how's everything?"}).json()
+     assert body["tool_calls"] == []
+     assert "which site" in body["answer"]
++
++
++def test_agent_query_is_traced_end_to_end(client: TestClient) -> None:
++    import mlflow
++
++    body = client.post(
++        "/agent/query", json={"question": "Is anything wrong at wind-02, and have we seen this before?"}
++    ).json()
++    assert body["trace_id"].startswith("tr-")
++
++    mlflow.flush_trace_async_logging()
++    trace = mlflow.get_trace(body["trace_id"])
++    assert trace is not None
++    spans = {s.name: s for s in trace.data.spans}
++
++    root = spans["agent_query"]
++    assert root.parent_id is None and root.span_type == "AGENT"
++    assert root.inputs == {"question": "Is anything wrong at wind-02, and have we seen this before?"}
++    assert root.outputs["answer"] == body["answer"]
++
++    assert spans["route_question"].outputs == {
++        "site_ids": ["wind-02"],
++        "intents": ["check_anomaly", "search_maintenance_logs"],
++    }
++    assert spans["check_anomaly"].span_type == "TOOL"
++    assert spans["check_anomaly"].outputs == body["tool_calls"][0]["output"]
++    assert spans["search_maintenance_logs"].span_type == "RETRIEVER"
++    assert spans["search_maintenance_logs"].outputs[0]["page_content"]
++    assert trace.info.tags["agent.mode"] == "rule_based"
+diff --git a/tests/test_api.py b/tests/test_api.py
+index ac6206f..f31df39 100644
+--- a/tests/test_api.py
++++ b/tests/test_api.py
+@@ -7,6 +7,8 @@ def test_health_reports_model_versions(client: TestClient) -> None:
+     body = r.json()
+     assert body["status"] == "ok"
+     assert set(body["model_versions"]) == {"expected_power", "anomaly_detector", "forecaster_1h"}
++    for model in body["models"].values():
++        assert model["alias"] == "champion" and model["run_id"] and model["metrics"]
+ 
+ 
+ def test_sites_lists_the_fleet(client: TestClient) -> None:
+diff --git a/tests/test_registry.py b/tests/test_registry.py
+new file mode 100644
+index 0000000..71b41c1
+--- /dev/null
++++ b/tests/test_registry.py
+@@ -0,0 +1,80 @@
++from types import SimpleNamespace
++from typing import Any, cast
++
++import pytest
++from fastapi.testclient import TestClient
++from mlflow import MlflowClient
++
++from app import registry
++from app.registry import EXPECTED_INPUTS, ModelContractError, Regressor, load_champion
++from ml.mlflow_config import CHAMPION_ALIAS, REGISTERED_NAMES
++from ml.promote import promote_if_not_worse
++
++
++def test_service_serves_the_champion_versions(client: TestClient) -> None:
++    models = client.get("/health").json()["models"]
++    mlflow_client = MlflowClient()
++    for key, name in REGISTERED_NAMES.items():
++        champion = mlflow_client.get_model_version_by_alias(name, CHAMPION_ALIAS)
++        assert models[key]["version"] == f"v{champion.version}"
++        assert models[key]["run_id"] == champion.run_id
++
++
++def test_every_champion_signature_matches_the_service_features(client: TestClient) -> None:
++    for key, name in REGISTERED_NAMES.items():
++        version = MlflowClient().get_model_version_by_alias(name, CHAMPION_ALIAS).version
++        assert registry._signature_inputs(f"models:/{name}/{version}") == EXPECTED_INPUTS[key]  # pyright: ignore[reportPrivateUsage]
++
++
++def test_service_refuses_a_model_trained_on_other_columns(
++    client: TestClient, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    reordered = list(reversed(EXPECTED_INPUTS["forecaster_1h"]))
++    monkeypatch.setitem(EXPECTED_INPUTS, "forecaster_1h", reordered)
++    with pytest.raises(ModelContractError, match="expects inputs"):
++        load_champion("forecaster_1h", Regressor)
++
++
++class _FakeRegistryClient:
++    """Just enough of MlflowClient for the promotion rule: version -> metric."""
++
++    def __init__(self, f1_by_version: dict[str, float], champion: str | None) -> None:
++        self.f1 = f1_by_version
++        self.champion = champion
++        self.tags: dict[str, str] = {}
++
++    def get_model_version(self, name: str, version: str) -> Any:
++        return SimpleNamespace(version=version, run_id=version)
++
++    def get_model_version_by_alias(self, name: str, alias: str) -> Any:
++        from mlflow.exceptions import MlflowException
++
++        if self.champion is None:
++            raise MlflowException("no alias")
++        return self.get_model_version(name, self.champion)
++
++    def get_run(self, run_id: str) -> Any:
++        return SimpleNamespace(data=SimpleNamespace(metrics={"f1": self.f1[run_id]}))
++
++    def set_registered_model_alias(self, name: str, alias: str, version: str) -> None:
++        self.champion = version
++
++    def set_model_version_tag(self, name: str, version: str, key: str, value: str) -> None:
++        self.tags[version] = value
++
++
++@pytest.mark.parametrize(
++    ("new_f1", "promoted"),
++    [(0.70, True), (0.666, True), (0.60, False)],
++)
++def test_challenger_is_promoted_only_if_not_worse(new_f1: float, promoted: bool) -> None:
++    fake = _FakeRegistryClient({"1": 0.666, "2": new_f1}, champion="1")
++    assert promote_if_not_worse(cast(MlflowClient, fake), "anomaly_detector", "2") is promoted
++    assert fake.champion == ("2" if promoted else "1")
++    assert fake.tags["2"].startswith("promoted" if promoted else "rejected")
++
++
++def test_first_version_becomes_champion() -> None:
++    fake = _FakeRegistryClient({"1": 0.5}, champion=None)
++    assert promote_if_not_worse(cast(MlflowClient, fake), "anomaly_detector", "1")
++    assert fake.champion == "1"
+-- 
+2.43.0
+
