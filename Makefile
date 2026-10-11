@@ -35,8 +35,8 @@ bench:
 models:                       ## registry versions per model; * marks @champion
 	$(PY) -m ml.promote
 
-mlflow-ui:                    ## runs, registered models and agent traces at http://localhost:5000
-	$(PY) -m mlflow ui --backend-store-uri sqlite:///ml/artifacts/mlflow/mlflow.db --port 5000
+mlflow-ui:                    ## runs, registered models and agent traces at http://127.0.0.1:5050
+	$(PY) -m mlflow ui --backend-store-uri sqlite:///ml/artifacts/mlflow/mlflow.db --host 127.0.0.1 --port 5050
 
 serve:
 	$(PY) -m uvicorn app.main:app --reload --port 8000

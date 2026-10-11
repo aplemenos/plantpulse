@@ -6,7 +6,7 @@ Storage defaults to a local SQLite tracking store under ml/artifacts/mlflow/
 at a shared MLflow server instead - nothing else needs to change.
 
 View runs, registered models and agent traces with:
-    make mlflow-ui      # http://localhost:5000
+    make mlflow-ui      # http://127.0.0.1:5050
 """
 
 from __future__ import annotations

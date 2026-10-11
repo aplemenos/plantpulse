@@ -83,7 +83,7 @@ make pipeline        # generate seeded data -> train (MLflow) -> build vector in
 make test            # 33 tests
 make regress         # regression gate vs ml/regression_baseline.json
 make serve           # http://localhost:8000  (UI at /, API docs at /docs)
-make mlflow-ui       # http://localhost:5000  (runs, registered models, agent traces)
+make mlflow-ui       # http://127.0.0.1:5050  (runs, registered models, agent traces)
 ```
 
 With Docker (adds Redis as the shared cache):
