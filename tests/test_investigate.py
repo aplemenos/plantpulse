@@ -61,6 +61,19 @@ def test_status_claims_must_match_the_model(result: dict[str, Any], answer: str,
     assert (check_status(answer, evidence(result)) == []) is ok
 
 
+def test_quoted_logs_do_not_count_as_status_claims() -> None:
+    # Regression: with the bge embedder, solar-02's search returned a curtailment log ending in
+    # "equipment healthy", and the verifier read that as the answer calling the site healthy.
+    log = {"log_id": "log-0007", "text": "2026-03-01 — Site wind-02: Output cap applied; equipment healthy."}
+    curtailment_log = {"log_id": "log-0008", "text": "2026-03-02 — Site wind-02: Grid curtailment order for 2h."}
+    answer = f"wind-02 looks anomalous. Past incidents: [log-0007] {log['text']} [log-0008] {curtailment_log['text']}"
+    logs = {"results": [log, curtailment_log]}
+    assert check_status(answer, evidence(ANOMALOUS, logs)) == []
+    # ...and a quoted curtailment log doesn't satisfy "mention today's curtailment" either
+    issues = check_status("wind-02 output is low. [log-0008] " + curtailment_log["text"], evidence(CURTAILED, logs))
+    assert [i["check"] for i in issues] == ["status"]
+
+
 def test_verify_reports_each_check() -> None:
     v = verify("wind-02 is anomalous at 999 kW [log-0042].", evidence(HEALTHY))
     assert not v["passed"]

@@ -10,7 +10,8 @@ Deterministic checks (always run, no LLM needed):
   citations  every cited log id was actually retrieved
   status     what the answer says about a site's health matches the model:
              no "anomalous" for a healthy site, no "healthy" for a flagged one,
-             and curtailment is mentioned when the site is curtailed
+             and curtailment is mentioned when the site is curtailed. Quoted
+             maintenance logs are ignored here: they describe the past.
 
 An LLM judge (agent/investigate.py) can add a fourth, semantic check on top.
 """
@@ -109,12 +110,26 @@ def check_citations(answer: str, evidence: Evidence) -> list[Issue]:
     ]
 
 
+def _without_quoted_logs(answer: str, evidence: Evidence) -> str:
+    """Drop maintenance-log text from the answer: it describes past events, not the site's current state.
+
+    A quoted log saying "equipment healthy" must not count as the answer calling the site healthy,
+    and a quoted curtailment log must not count as the answer mentioning today's curtailment.
+    """
+    for step in evidence:
+        if step["tool"] == "search_maintenance_logs":
+            for hit in cast(list[dict[str, Any]], step["output"].get("results", [])):
+                answer = answer.replace(hit["text"], " ")
+    return answer
+
+
 def check_status(answer: str, evidence: Evidence) -> list[Issue]:
     results = {
         step["input"]["site_id"]: step["output"]
         for step in evidence
         if step["tool"] == "check_anomaly" and "error" not in step["output"]
     }
+    answer = _without_quoted_logs(answer, evidence)
     sentences = _SENTENCE_SPLIT.split(answer)
     issues: list[Issue] = []
     for site_id, result in results.items():
