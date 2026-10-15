@@ -23,10 +23,16 @@ verifier runs in both modes.
 Every run is one MLflow trace: plan, each tool call, draft, and each
 verification (EVALUATOR spans), so a wrong answer can be traced to the step
 that caused it.
+
+Inside a session (agent/sessions.py) the pipeline also receives the
+conversation so far (Context) and reports each step to an event sink, so a
+follow-up like "and wind-03?" is understood and an interrupted turn can be
+resumed without re-running the tool calls it already made.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable
 from typing import Any, cast
@@ -70,21 +76,56 @@ class StepResult(TypedDict):
     input: dict[str, Any]
     output: dict[str, Any]
     skipped: bool
+    reused: bool  # output taken from the session log instead of calling the tool again
     note: str
 
 
-Planner = Callable[[AppState, str], list[dict[str, Any]]]
-Drafter = Callable[[str, list[StepResult], list[Issue]], str]
+class Turn(TypedDict):
+    turn: int
+    question: str
+    answer: str
+
+
+class Context(TypedDict):
+    """What the agent knows from earlier turns: a compacted summary plus the recent turns verbatim."""
+
+    summary: str
+    turns: list[Turn]
+    sites: list[str]    # sites the last turn was about
+    intents: list[str]  # what the last turn asked for
+
+
+def empty_context() -> Context:
+    return {"summary": "", "turns": [], "sites": [], "intents": []}
+
+
+def context_text(context: Context) -> str:
+    lines: list[str] = []
+    if context["summary"]:
+        lines.append(f"Earlier in this conversation (summarized):\n{context['summary']}")
+    for t in context["turns"]:
+        lines.append(f"Turn {t['turn']} question: {t['question']}\nTurn {t['turn']} answer: {t['answer']}")
+    return "\n\n".join(lines)
+
+
+Planner = Callable[[AppState, str, Context], list[dict[str, Any]]]
+Drafter = Callable[[str, list[StepResult], list[Issue], Context], str]
 Judge = Callable[[str, list[StepResult], str], list[Issue]]
+EventSink = Callable[[str, dict[str, Any]], object]
 
 
 # --- planning -----------------------------------------------------------------
 
 
-def rule_based_plan(state: AppState, question: str) -> list[dict[str, Any]]:
-    """Check health first; forecast if asked; search history if asked, or if the site turns out anomalous."""
-    sites = extract_site_ids(question, [s["site_id"] for s in state.sites])
-    intents = extract_intents(question)
+def rule_based_plan(state: AppState, question: str, context: Context | None = None) -> list[dict[str, Any]]:
+    """Check health first; forecast if asked; search history if asked, or if the site turns out anomalous.
+
+    Follow-ups inherit from the previous turn: "and wind-03?" keeps what was asked,
+    "what about the forecast?" keeps the sites.
+    """
+    context = context or empty_context()
+    sites = extract_site_ids(question, [s["site_id"] for s in state.sites]) or context["sites"]
+    intents = extract_intents(question, default=False) or context["intents"] or ["check_anomaly"]
     plan: list[dict[str, Any]] = []
     for site_id in sites:
         plan.append({"tool": "check_anomaly", "input": {"site_id": site_id},
@@ -133,21 +174,45 @@ def validate_plan(state: AppState, raw: list[dict[str, Any]]) -> tuple[list[Plan
 # --- execution ----------------------------------------------------------------
 
 
-def execute(state: AppState, plan: list[PlanStep]) -> list[StepResult]:
+def step_key(tool: str, tool_input: dict[str, Any]) -> str:
+    return json.dumps([tool, tool_input], sort_keys=True, default=str)
+
+
+def execute(
+    state: AppState,
+    plan: list[PlanStep],
+    done: dict[str, dict[str, Any]] | None = None,
+    on_step: Callable[[StepResult], object] | None = None,
+) -> list[StepResult]:
+    """Run the plan. Outputs in `done` (from an interrupted run) are reused instead of calling the tool again."""
+    done = done or {}
     anomalous: dict[str, bool] = {}
     results: list[StepResult] = []
     for step in plan:
         if step["condition"].startswith("anomalous:"):
             site = step["condition"].split(":", 1)[1]
             if not anomalous.get(site, False):
-                results.append({"tool": step["tool"], "input": step["input"], "output": {},
-                                "skipped": True, "note": f"skipped: {site} is not anomalous"})
+                results.append({"tool": step["tool"], "input": step["input"], "output": {}, "skipped": True,
+                                "reused": False, "note": f"skipped: {site} is not anomalous"})
                 continue
-        output = dispatch(state, step["tool"], step["input"])
+        key = step_key(step["tool"], step["input"])
+        reused = key in done
+        output = done[key] if reused else dispatch(state, step["tool"], step["input"])
         if step["tool"] == "check_anomaly" and "error" not in output:
             anomalous[step["input"]["site_id"]] = bool(output["is_anomaly"]) and not output["is_curtailed"]
-        results.append({"tool": step["tool"], "input": step["input"], "output": output, "skipped": False, "note": ""})
+        result: StepResult = {"tool": step["tool"], "input": step["input"], "output": output, "skipped": False,
+                              "reused": reused, "note": "reused from the session log" if reused else ""}
+        results.append(result)
+        if on_step is not None and not reused:
+            on_step(result)
     return results
+
+
+def focus_of(plan: list[PlanStep]) -> tuple[list[str], list[str]]:
+    """The sites a plan is about, and the tools it runs unconditionally: what a follow-up inherits."""
+    sites = list(dict.fromkeys(s["input"]["site_id"] for s in plan if "site_id" in s["input"]))
+    intents = list(dict.fromkeys(s["tool"] for s in plan if s["condition"] == "always"))
+    return sites, intents
 
 
 def evidence_of(results: list[StepResult]) -> Evidence:
@@ -163,7 +228,7 @@ def format_results(results: list[StepResult]) -> str:
     return "\n\n".join(blocks)
 
 
-def template_draft(question: str, results: list[StepResult], issues: list[Issue]) -> str:
+def template_draft(question: str, results: list[StepResult], issues: list[Issue], context: Context | None = None) -> str:
     """Offline drafter: states only what the tools returned."""
     parts: list[str] = []
     for r in results:
@@ -275,14 +340,18 @@ def llm_roles(api_key: str) -> tuple[Planner, Drafter, Judge]:
     client = anthropic.Anthropic(api_key=api_key)
     tool_list = "\n".join(f"- {s['name']}: {s.get('description', '')}" for s in TOOL_SPECS)
 
-    def plan(state: AppState, question: str) -> list[dict[str, Any]]:
+    def plan(state: AppState, question: str, context: Context) -> list[dict[str, Any]]:
         sites = ", ".join(s["site_id"] for s in state.sites)
         content = f"Question: {question}\n\nKnown sites: {sites}\n\nTools:\n{tool_list}"
+        if history := context_text(context):
+            content = f"{history}\n\nResolve references like 'it' or 'and wind-03?' using the conversation.\n\n{content}"
         return cast(list[dict[str, Any]],
                     _forced_tool_input(client, planner_model(), PLANNER_PROMPT, SUBMIT_PLAN, content).get("steps", []))
 
-    def draft(question: str, results: list[StepResult], issues: list[Issue]) -> str:
+    def draft(question: str, results: list[StepResult], issues: list[Issue], context: Context) -> str:
         content = f"Question: {question}\n\nTool results:\n{format_results(results)}"
+        if history := context_text(context):
+            content = f"{history}\n\n{content}"
         if issues:
             content += "\n\nA reviewer rejected your previous answer. Fix these problems:\n" + "\n".join(
                 f"- {i['detail']}" for i in issues)
@@ -317,24 +386,44 @@ def _verify(question: str, results: list[StepResult], answer: str, judge: Judge 
 
 
 def run_pipeline(
-    state: AppState, question: str, planner: Planner, drafter: Drafter, judge: Judge | None,
+    state: AppState,
+    question: str,
+    planner: Planner,
+    drafter: Drafter,
+    judge: Judge | None,
     as_of: str | None = None,
+    context: Context | None = None,
+    sink: EventSink | None = None,
+    prior_plan: list[PlanStep] | None = None,
+    done: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Plan, execute, draft, verify. `sink` receives each step as an event; `prior_plan` and `done`
+    come from an interrupted run of the same turn, so it resumes instead of starting over."""
+    context = context or empty_context()
+    emit: EventSink = sink or (lambda kind, payload: None)
+
     with mlflow.start_span(name="plan", span_type=SpanType.CHAIN) as span:
-        span.set_inputs({"question": question, "as_of": as_of})
-        plan, dropped = validate_plan(state, planner(state, question))
-        if as_of:  # investigate a past moment: pin every point-in-time tool to it
-            for step in plan:
-                if step["tool"] in ("check_anomaly", "forecast_power"):
-                    step["input"] = {**step["input"], "as_of": as_of}
-        span.set_outputs({"plan": plan, "dropped": dropped})
+        span.set_inputs({"question": question, "as_of": as_of, "context": context_text(context)})
+        if prior_plan is not None:
+            plan, dropped = prior_plan, []
+        else:
+            plan, dropped = validate_plan(state, planner(state, question, context))
+            if as_of:  # investigate a past moment: pin every point-in-time tool to it
+                for step in plan:
+                    if step["tool"] in ("check_anomaly", "forecast_power"):
+                        step["input"] = {**step["input"], "as_of": as_of}
+            sites, intents = focus_of(plan)
+            emit("plan", {"plan": plan, "dropped": dropped, "sites": sites, "intents": intents})
+        span.set_outputs({"plan": plan, "dropped": dropped, "resumed": prior_plan is not None})
 
     with mlflow.start_span(name="execute", span_type=SpanType.CHAIN) as span:
-        results = execute(state, plan)
-        span.set_outputs({"executed": sum(not r["skipped"] for r in results),
+        results = execute(state, plan, done, on_step=lambda r: emit(
+            "tool_call", {"tool": r["tool"], "input": r["input"], "output": r["output"]}))
+        span.set_outputs({"executed": sum(not r["skipped"] and not r["reused"] for r in results),
+                          "reused": sum(r["reused"] for r in results),
                           "skipped": sum(r["skipped"] for r in results)})
 
-    answer = drafter(question, results, [])
+    answer = drafter(question, results, [], context)
     history: list[Verification] = []
     for attempt in range(MAX_REVISIONS + 1):
         verification = _verify(question, results, answer, judge)
@@ -343,11 +432,11 @@ def run_pipeline(
             break
         with mlflow.start_span(name="revise", span_type=SpanType.CHAIN) as span:
             span.set_inputs({"issues": verification["issues"]})
-            answer = drafter(question, results, verification["issues"])
+            answer = drafter(question, results, verification["issues"], context)
             span.set_outputs({"answer": answer})
 
     final = history[-1]
-    return {
+    result: dict[str, Any] = {
         "answer": answer,
         "plan": plan,
         "plan_dropped": dropped,
@@ -355,13 +444,27 @@ def run_pipeline(
         "verification": {**final, "revisions": len(history) - 1,
                          "rejected_drafts": [h["issues"] for h in history[:-1]]},
     }
+    emit("answer", {"answer": answer, "verification": result["verification"]})
+    return result
 
 
-def investigate(state: AppState, question: str, as_of: str | None = None, allow_llm: bool = True) -> dict[str, Any]:
-    """Run the pipeline. allow_llm=False forces the offline roles (used by the regression gate)."""
+def investigate(
+    state: AppState,
+    question: str,
+    as_of: str | None = None,
+    allow_llm: bool = True,
+    *,
+    context: Context | None = None,
+    sink: EventSink | None = None,
+    prior_plan: list[PlanStep] | None = None,
+    done: dict[str, dict[str, Any]] | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Run the pipeline. allow_llm=False forces the offline roles (used by the regression gate).
+    The keyword arguments are supplied by agent/sessions.py for multi-turn conversations."""
     ensure_tracing()
     with mlflow.start_span(name="agent_investigate", span_type=SpanType.AGENT) as span:
-        span.set_inputs({"question": question, "as_of": as_of})
+        span.set_inputs({"question": question, "as_of": as_of, "session_id": session_id})
         api_key = os.environ.get("ANTHROPIC_API_KEY") if allow_llm else None
         result: dict[str, Any]
         if api_key:
@@ -369,16 +472,18 @@ def investigate(state: AppState, question: str, as_of: str | None = None, allow_
 
             try:
                 plan, draft, judge = llm_roles(api_key)
-                result = run_pipeline(state, question, plan, draft, judge, as_of)
+                result = run_pipeline(state, question, plan, draft, judge, as_of, context, sink, prior_plan, done)
                 result["mode"] = "llm"
                 result["models"] = {"planner": planner_model(), "executor": executor_model(),
                                     "verifier": verifier_model()}
             except anthropic.APIError as exc:
-                result = run_pipeline(state, question, rule_based_plan, template_draft, None, as_of)
+                result = run_pipeline(state, question, rule_based_plan, template_draft, None,
+                                      as_of, context, sink, prior_plan, done)
                 result["mode"] = "rule_based"
                 result["llm_error"] = str(exc)
         else:
-            result = run_pipeline(state, question, rule_based_plan, template_draft, None, as_of)
+            result = run_pipeline(state, question, rule_based_plan, template_draft, None,
+                                  as_of, context, sink, prior_plan, done)
             result["mode"] = "rule_based"
 
         verification = cast(dict[str, Any], result["verification"])
@@ -387,8 +492,12 @@ def investigate(state: AppState, question: str, as_of: str | None = None, allow_
                              "revisions": verification["revisions"]})
         trace_id = span.trace_id
         if tracing_enabled():
-            mlflow.update_current_trace(tags={"agent.mode": result["mode"], "agent.pipeline": "investigate",
-                                              "verified": str(verification["passed"]).lower()})
+            # session_id groups a conversation's traces together in the MLflow UI.
+            mlflow.update_current_trace(
+                tags={"agent.mode": result["mode"], "agent.pipeline": "investigate",
+                      "verified": str(verification["passed"]).lower()},
+                session_id=session_id,
+            )
     if tracing_enabled():
         result["trace_id"] = trace_id
     return result

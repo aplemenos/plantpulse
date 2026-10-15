@@ -72,6 +72,8 @@
     <div class="mode">
       <label><input type="checkbox" id="investigate"> Investigate (plan → execute → verify)</label>
       <input type="text" id="asOf" placeholder="as of, e.g. 2026-04-18 11:00" autocomplete="off" hidden>
+      <span id="sessionInfo" hidden></span>
+      <button type="button" id="newSession" hidden>New conversation</button>
     </div>
     <div class="examples" id="examples"></div>
     <div class="answer" id="answer"></div>
@@ -177,10 +179,17 @@ $("ask").onsubmit = async (e) => {
     `Tool calls (${res.tool_calls.length}, mode: ${res.mode}${res.llm_error ? ", LLM failed - fell back" : ""})${traceRef}`;
 };
 
+// Investigations run inside a session, so follow-ups ("and wind-03?") see the earlier turns.
+let sessionId = null;
+
 async function runInvestigation(question) {
   const as_of = $("asOf").value.trim() || null;
-  const res = await (await fetch("/agent/investigate", {method: "POST",
+  if (!sessionId) sessionId = (await (await fetch("/sessions", {method: "POST"})).json()).session_id;
+  const res = await (await fetch(`/sessions/${sessionId}/investigate`, {method: "POST",
     headers: {"Content-Type": "application/json"}, body: JSON.stringify({question, as_of})})).json();
+  $("sessionInfo").hidden = $("newSession").hidden = false;
+  $("sessionInfo").textContent = `conversation ${sessionId} · turn ${res.turn}` +
+    (res.context_compacted ? " · older turns summarized" : "");
   const v = res.verification;
   $("answer").textContent = res.answer;
   $("verdict").hidden = false;
@@ -197,6 +206,10 @@ async function runInvestigation(question) {
 }
 
 $("investigate").onchange = () => { $("asOf").hidden = !$("investigate").checked; };
+$("newSession").onclick = () => {
+  sessionId = null; $("sessionInfo").hidden = $("newSession").hidden = true;
+  $("answer").textContent = ""; $("verdict").hidden = true; $("trace").hidden = true;
+};
 
 // Demo: investigate a site at its most suspicious moment, so the conditional log search runs.
 const demo = document.createElement("button");
@@ -204,7 +217,7 @@ demo.type = "button"; demo.textContent = "investigate wind-03 at its most suspic
 demo.onclick = async () => {
   const top = await (await fetch("/sites/wind-03/top-flagged")).json();
   $("investigate").checked = true; $("asOf").hidden = false; $("asOf").value = top.timestamp;
-  $("q").value = "investigate wind-03"; $("ask").requestSubmit();
+  sessionId = null; $("q").value = "investigate wind-03"; $("ask").requestSubmit();
 };
 $("examples").appendChild(demo);
 

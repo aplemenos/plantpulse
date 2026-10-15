@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
 
+from agent.sessions import NothingToResume, SessionStore, UnknownSession, build_context, investigate_in_session, resume
 from agent.tracing import ensure_tracing, flush_traces, tracing_enabled
 from app.inference import (
     NotEnoughData,
@@ -42,12 +43,14 @@ from ml.features import ANOMALY_FEATURES
 from ml.vector_store import SearchHit
 
 _state: AppState | None = None
+_sessions: SessionStore | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    global _state
+    global _state, _sessions
     _state = AppState()
+    _sessions = SessionStore()
     print(f"[startup] models loaded: {_state.registry.versions()}")
     print(f"[startup] sites: {[s['site_id'] for s in _state.sites]}")
     ensure_tracing()
@@ -134,6 +137,55 @@ def agent_investigate(req: InvestigateRequest) -> dict[str, Any]:
     from agent.investigate import investigate
 
     return investigate(get_state(), req.question, req.as_of)
+
+
+def get_sessions() -> SessionStore:
+    if _sessions is None:
+        raise HTTPException(503, "service still starting up")
+    return _sessions
+
+
+@app.post("/sessions")
+def create_session() -> dict[str, str]:
+    """Start a conversation. Follow-up questions in it see the earlier turns."""
+    return {"session_id": get_sessions().create()}
+
+
+@app.post("/sessions/{session_id}/investigate")
+def session_investigate(session_id: str, req: InvestigateRequest) -> dict[str, Any]:
+    try:
+        return investigate_in_session(get_state(), get_sessions(), session_id, req.question, req.as_of)
+    except UnknownSession as exc:
+        raise HTTPException(404, f"unknown session {session_id!r}") from exc
+
+
+@app.post("/sessions/{session_id}/resume")
+def session_resume(session_id: str) -> dict[str, Any]:
+    """Finish an interrupted turn from the event log, reusing tool outputs already recorded."""
+    try:
+        return resume(get_state(), get_sessions(), session_id)
+    except UnknownSession as exc:
+        raise HTTPException(404, f"unknown session {session_id!r}") from exc
+    except NothingToResume as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/sessions/{session_id}/events")
+def session_events(session_id: str, start: int = 0, end: int | None = None) -> list[dict[str, Any]]:
+    """The raw, append-only log; any slice can be reread."""
+    try:
+        return [dict(e) for e in get_sessions().events(session_id, start, end)]
+    except UnknownSession as exc:
+        raise HTTPException(404, f"unknown session {session_id!r}") from exc
+
+
+@app.get("/sessions/{session_id}/context")
+def session_context(session_id: str) -> dict[str, Any]:
+    """What the agent will see on the next turn: compacted summary plus recent turns."""
+    try:
+        return dict(build_context(get_sessions().events(session_id)))
+    except UnknownSession as exc:
+        raise HTTPException(404, f"unknown session {session_id!r}") from exc
 
 
 @app.get("/debug/cache-stats")

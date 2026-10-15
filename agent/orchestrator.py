@@ -72,7 +72,8 @@ def extract_site_ids(question: str, known_sites: list[str]) -> list[str]:
     return matched
 
 
-def extract_intents(question: str) -> list[str]:
+def extract_intents(question: str, default: bool = True) -> list[str]:
+    """Tools the question asks for. With default=False, a question that names no intent returns []."""
     q = question.lower()
     intents: list[str] = []
     if any(w in q for w in ("anomal", "wrong", "issue", "problem", "fault", "fail", "drop")):
@@ -81,7 +82,7 @@ def extract_intents(question: str) -> list[str]:
         intents.append("forecast_power")
     if _HISTORY_RE.search(q):
         intents.append("search_maintenance_logs")
-    if not intents:
+    if not intents and default:
         intents.append("check_anomaly")  # sensible default for an analytics question
     return intents
 

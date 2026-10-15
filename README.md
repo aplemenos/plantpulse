@@ -68,7 +68,7 @@ The regression check caught the latency problem and a real agent-routing bug ("h
 | Integrate ML into production pipelines and APIs | `app/` FastAPI service; models load once at startup from the MLflow Model Registry (`@champion`), after a signature check |
 | Optimize latency, throughput, memory | Measured latency fix above; `ml/benchmark_parallel.py` (naive vs vectorized vs process pool, results asserted identical) |
 | Model-serving infrastructure (API, batch, streaming) | REST endpoints, `/predict/batch`, and **SSE `/stream/telemetry`** running live per-event inference |
-| Testing and validation frameworks for ML | `tests/`: feature-skew, leakage, API-contract, registry/promotion, agent and tracing, retrieval citation and verifier tests (69) |
+| Testing and validation frameworks for ML | `tests/`: feature-skew, leakage, API-contract, registry/promotion, agent and tracing, retrieval citation and verifier and session tests (77) |
 | Caching and provenance for models, code and data | Redis/in-process prediction cache; **DVC** for data and artifacts; **MLflow** runs tagged with data hash and git commit, models logged with signatures, `/health` reports which registry version and run each served model came from |
 | CI/CD for model deployment | `.github/workflows/ci.yml`: rebuild from source, then tests, then regression gate, then image build and container smoke test, then deploy |
 | Regression testing to monitor the analytics engine | `ml/regression_check.py`: quality, p95 latency, agent-routing accuracy, retrieval quality and data contract against a committed baseline, with run history for trends |
@@ -80,7 +80,7 @@ The regression check caught the latency problem and a real agent-routing bug ("h
 ```bash
 make install         # pip install -r requirements-dev.txt
 make pipeline        # generate seeded data -> train (MLflow) -> build vector index
-make test            # 69 tests
+make test            # 77 tests
 make regress         # regression gate vs ml/regression_baseline.json
 make retrieval       # vector vs BM25 vs hybrid search on the golden queries
 make serve           # http://localhost:8000  (UI at /, API docs at /docs)
@@ -110,6 +110,16 @@ To run the agent in **LLM tool-use mode**, set `ANTHROPIC_API_KEY`. Without a ke
 If the verifier rejects the draft, the executor gets one revision with the list of problems. If that still fails, the answer is returned **marked unverified, with the issues**, rather than hidden. With an API key the three roles use different models (`PLANTPULSE_PLANNER_MODEL`, `PLANTPULSE_EXECUTOR_MODEL`, `PLANTPULSE_VERIFIER_MODEL`; by default Sonnet plans and judges, Haiku drafts). Without a key, a rule-based planner and a template drafter run the same pipeline, so it is fully tested offline. Pass `as_of` to investigate a past moment; the UI's example button uses wind-03's most suspicious moment.
 
 Each investigation is one MLflow trace with `plan`, `execute`, the tool calls, and `verify` (EVALUATOR) spans. The regression gate runs seven golden investigations and requires all of them to pass the verifier.
+
+## Sessions: follow-ups, an event log, compaction and resume
+
+Investigations can run inside a conversation (`POST /sessions`, then `POST /sessions/{id}/investigate`; the UI's Investigate mode does this). The design separates the agent loop, the tools, and the **session log**, so any process can pick a conversation up:
+
+- **Event log.** Every turn is written as append-only events in SQLite (`user_message`, `plan`, `tool_call`, `answer`, `compaction`), each committed before the next step. `GET /sessions/{id}/events?start=&end=` rereads any slice.
+- **Follow-ups.** The agent gets the conversation as context. "and wind-03?" keeps the previous question, and "have we seen that there before?" keeps the previous site. In LLM mode the planner and drafter see the conversation; offline, the planner inherits sites and intents from the last turn.
+- **Compaction.** After three verbatim turns, older ones are folded into a running summary. The summary is a new event; the original events are never edited or deleted. `GET /sessions/{id}/context` shows exactly what the agent will see next.
+- **Resume.** If a turn is interrupted (crash, deploy, timeout), `POST /sessions/{id}/resume` finishes it from the log, reusing the recorded plan and tool outputs instead of calling the tools again.
+- **Tracing.** Each turn's trace carries the session id, so MLflow groups a conversation's traces together.
 
 ## RAG over maintenance logs
 
@@ -169,7 +179,7 @@ Multi-horizon forecasts with prediction intervals · drift monitoring on live fe
 
 ```
 app/       FastAPI service: registry loader, cache, inference, SSE stream, UI
-agent/     tool specs, orchestrator (tool-use / rule-based), plan-execute-verify pipeline, verifier, tracing
+agent/     tool specs, orchestrator (tool-use / rule-based), plan-execute-verify pipeline, verifier, sessions, tracing
 ml/        data generation, features, training + MLflow registry/promotion, vector store, benchmark, regression gate
 tests/     feature, API-contract and agent tests
 infra/     deployment helpers

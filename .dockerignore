@@ -12,3 +12,4 @@ ml/regression_history.jsonl
 tests
 notebooks
 .cache/
+var

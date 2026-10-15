@@ -12,3 +12,4 @@ mlartifacts/
 ml/regression_history.jsonl
 .env
 .cache/
+var/
