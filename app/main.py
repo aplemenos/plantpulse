@@ -34,6 +34,7 @@ from app.schemas import (
     AnomalyRequest,
     BatchRequest,
     ForecastRequest,
+    InvestigateRequest,
     SearchRequest,
 )
 from app.state import AppState, FlaggedMoment, SiteInfo
@@ -125,6 +126,14 @@ def agent_query(req: AgentQueryRequest) -> dict[str, Any]:
     )
 
     return answer_question(get_state(), req.question)
+
+
+@app.post("/agent/investigate")
+def agent_investigate(req: InvestigateRequest) -> dict[str, Any]:
+    """Plan -> execute -> independently verify. See agent/investigate.py."""
+    from agent.investigate import investigate
+
+    return investigate(get_state(), req.question, req.as_of)
 
 
 @app.get("/debug/cache-stats")

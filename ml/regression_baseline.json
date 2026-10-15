@@ -11,5 +11,6 @@
   "retrieval_tfidf_mrr": 0.9375,
   "retrieval_bge_hit_at_3": 0.9375,
   "retrieval_bge_precision_at_3": 0.7917,
-  "retrieval_bge_mrr": 0.9375
+  "retrieval_bge_mrr": 0.9375,
+  "investigation_verified_rate": 1.0
 }

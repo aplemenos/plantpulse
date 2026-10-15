@@ -39,6 +39,10 @@
   .examples button { border: 0; background: var(--chip); color: var(--ink); border-radius: 999px;
                      padding: 4px 10px; font-size: 13px; cursor: pointer; }
   .answer { margin-top: 14px; white-space: pre-wrap; }
+  .mode { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 10px; font-size: 13px; color: var(--muted); }
+  .mode input[type=text] { flex: 0 1 220px; padding: 6px 10px; font-size: 13px; }
+  .verdict { margin-top: 8px; font-size: 13px; font-weight: 600; }
+  .verdict.ok { color: var(--accent); } .verdict.bad { color: var(--bad); }
   details { margin-top: 10px; color: var(--muted); font-size: 13px; }
   pre { overflow-x: auto; background: var(--bg); border-radius: 8px; padding: 10px; font-size: 12px; }
   svg { width: 100%; height: 160px; display: block; }
@@ -65,8 +69,13 @@
       <input type="text" id="q" placeholder="e.g. is anything wrong with wind-02, and have we seen it before?" autocomplete="off">
       <button class="go" type="submit">Ask</button>
     </form>
+    <div class="mode">
+      <label><input type="checkbox" id="investigate"> Investigate (plan → execute → verify)</label>
+      <input type="text" id="asOf" placeholder="as of, e.g. 2026-04-18 11:00" autocomplete="off" hidden>
+    </div>
     <div class="examples" id="examples"></div>
     <div class="answer" id="answer"></div>
+    <div class="verdict" id="verdict" hidden></div>
     <details id="trace" hidden><summary>Tool calls</summary><pre id="traceBody"></pre></details>
   </div>
 
@@ -154,7 +163,8 @@ $("ask").onsubmit = async (e) => {
   e.preventDefault();
   const question = $("q").value.trim();
   if (!question) return;
-  $("answer").textContent = "Thinking…"; $("trace").hidden = true;
+  $("answer").textContent = "Thinking…"; $("trace").hidden = true; $("verdict").hidden = true;
+  if ($("investigate").checked) return runInvestigation(question);
   const res = await (await fetch("/agent/query", {method: "POST",
     headers: {"Content-Type": "application/json"}, body: JSON.stringify({question})})).json();
   $("answer").textContent = res.answer;
@@ -166,6 +176,37 @@ $("ask").onsubmit = async (e) => {
   $("trace").querySelector("summary").textContent =
     `Tool calls (${res.tool_calls.length}, mode: ${res.mode}${res.llm_error ? ", LLM failed - fell back" : ""})${traceRef}`;
 };
+
+async function runInvestigation(question) {
+  const as_of = $("asOf").value.trim() || null;
+  const res = await (await fetch("/agent/investigate", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({question, as_of})})).json();
+  const v = res.verification;
+  $("answer").textContent = res.answer;
+  $("verdict").hidden = false;
+  $("verdict").className = "verdict " + (v.passed ? "ok" : "bad");
+  $("verdict").textContent = v.passed
+    ? `Verified independently${v.revisions ? ` after ${v.revisions} revision` : ""} (${Object.keys(v.checks).join(", ")})`
+    : `Not verified: ${v.issues.map(i => i.detail).join("; ")}`;
+  $("traceBody").textContent = JSON.stringify({plan: res.plan, steps: res.steps, verification: v}, null, 2);
+  $("trace").hidden = false;
+  const ran = res.steps.filter(s => !s.skipped).length;
+  $("trace").querySelector("summary").textContent =
+    `Plan: ${res.plan.length} steps, ${ran} run, ${res.plan.length - ran} skipped · mode: ${res.mode}` +
+    `${res.llm_error ? ", LLM failed - fell back" : ""}${res.trace_id ? ` · MLflow trace ${res.trace_id}` : ""}`;
+}
+
+$("investigate").onchange = () => { $("asOf").hidden = !$("investigate").checked; };
+
+// Demo: investigate a site at its most suspicious moment, so the conditional log search runs.
+const demo = document.createElement("button");
+demo.type = "button"; demo.textContent = "investigate wind-03 at its most suspicious moment";
+demo.onclick = async () => {
+  const top = await (await fetch("/sites/wind-03/top-flagged")).json();
+  $("investigate").checked = true; $("asOf").hidden = false; $("asOf").value = top.timestamp;
+  $("q").value = "investigate wind-03"; $("ask").requestSubmit();
+};
+$("examples").appendChild(demo);
 
 for (const ex of EXAMPLES) {
   const b = document.createElement("button");

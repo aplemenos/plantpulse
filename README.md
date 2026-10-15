@@ -68,19 +68,19 @@ The regression check caught the latency problem and a real agent-routing bug ("h
 | Integrate ML into production pipelines and APIs | `app/` FastAPI service; models load once at startup from the MLflow Model Registry (`@champion`), after a signature check |
 | Optimize latency, throughput, memory | Measured latency fix above; `ml/benchmark_parallel.py` (naive vs vectorized vs process pool, results asserted identical) |
 | Model-serving infrastructure (API, batch, streaming) | REST endpoints, `/predict/batch`, and **SSE `/stream/telemetry`** running live per-event inference |
-| Testing and validation frameworks for ML | `tests/`: feature-skew, leakage, API-contract, registry/promotion, agent and tracing, retrieval and citation tests (49) |
+| Testing and validation frameworks for ML | `tests/`: feature-skew, leakage, API-contract, registry/promotion, agent and tracing, retrieval citation and verifier tests (69) |
 | Caching and provenance for models, code and data | Redis/in-process prediction cache; **DVC** for data and artifacts; **MLflow** runs tagged with data hash and git commit, models logged with signatures, `/health` reports which registry version and run each served model came from |
 | CI/CD for model deployment | `.github/workflows/ci.yml`: rebuild from source, then tests, then regression gate, then image build and container smoke test, then deploy |
 | Regression testing to monitor the analytics engine | `ml/regression_check.py`: quality, p95 latency, agent-routing accuracy, retrieval quality and data contract against a committed baseline, with run history for trends |
 | Vector DBs / embeddings / RAG | Hybrid search (FAISS vectors + BM25, fused with RRF) with a per-site filter; bge-small embeddings; answers cite log ids, checked against what was retrieved |
-| Agent layer integration | `agent/`: Anthropic tool-use loop, plus a deterministic fallback that calls the *same* tools; every question is an **MLflow trace** |
+| Agent layer integration | `agent/`: Anthropic tool-use loop, plus a deterministic fallback that calls the *same* tools; a **plan → execute → verify** pipeline with an independent verifier; every question is an **MLflow trace** |
 
 ## Run it
 
 ```bash
 make install         # pip install -r requirements-dev.txt
 make pipeline        # generate seeded data -> train (MLflow) -> build vector index
-make test            # 49 tests
+make test            # 69 tests
 make regress         # regression gate vs ml/regression_baseline.json
 make retrieval       # vector vs BM25 vs hybrid search on the golden queries
 make serve           # http://localhost:8000  (UI at /, API docs at /docs)
@@ -94,6 +94,22 @@ docker compose up --build    # http://localhost:8000
 ```
 
 To run the agent in **LLM tool-use mode**, set `ANTHROPIC_API_KEY`. Without a key it falls back to a deterministic rule-based planner over the same tools, which keeps it fully runnable offline and testable in CI.
+
+## Investigations: plan, execute, verify
+
+`POST /agent/investigate` (and the **Investigate** toggle in the UI) runs a three-role pipeline in which nothing checks its own work:
+
+1. **Planner.** Decides the tool calls before anything runs. Steps can be conditional, e.g. "search this site's maintenance history only if it is anomalous". Invalid steps (unknown tools or sites) are dropped and reported, not executed.
+2. **Executor.** Runs the plan, then drafts the answer from the tool results alone.
+3. **Verifier.** Checks the draft against the tool outputs and never sees the drafter's reasoning:
+   - every number must appear in a tool output (allowing for rounding and percentages);
+   - every cited log must have been retrieved;
+   - what the answer says about a site's health must match the model, including mentioning curtailment;
+   - in LLM mode, a separate judge model also looks for unsupported claims.
+
+If the verifier rejects the draft, the executor gets one revision with the list of problems. If that still fails, the answer is returned **marked unverified, with the issues**, rather than hidden. With an API key the three roles use different models (`PLANTPULSE_PLANNER_MODEL`, `PLANTPULSE_EXECUTOR_MODEL`, `PLANTPULSE_VERIFIER_MODEL`; by default Sonnet plans and judges, Haiku drafts). Without a key, a rule-based planner and a template drafter run the same pipeline, so it is fully tested offline. Pass `as_of` to investigate a past moment; the UI's example button uses wind-03's most suspicious moment.
+
+Each investigation is one MLflow trace with `plan`, `execute`, the tool calls, and `verify` (EVALUATOR) spans. The regression gate runs seven golden investigations and requires all of them to pass the verifier.
 
 ## RAG over maintenance logs
 
@@ -153,7 +169,7 @@ Multi-horizon forecasts with prediction intervals · drift monitoring on live fe
 
 ```
 app/       FastAPI service: registry loader, cache, inference, SSE stream, UI
-agent/     tool specs, orchestrator (Anthropic tool-use / rule-based fallback), tracing
+agent/     tool specs, orchestrator (tool-use / rule-based), plan-execute-verify pipeline, verifier, tracing
 ml/        data generation, features, training + MLflow registry/promotion, vector store, benchmark, regression gate
 tests/     feature, API-contract and agent tests
 infra/     deployment helpers

@@ -8,6 +8,8 @@ window and checks four kinds of behaviour against a committed baseline
   - model quality   : anomaly precision/recall/F1, forecaster + expected-power MAE
   - serving latency : p50/p95 of the real predict_anomaly() path, cache bypassed
   - agent routing   : a golden set of questions -> the tools the agent should call
+  - investigation   : share of golden investigations whose answer passes the
+                      independent verifier (agent/verifier.py)
   - retrieval       : hit@3 / precision@3 / MRR of maintenance-log search on golden
                       queries (ml/retrieval_eval.py), baselined per embedder
   - data contract   : schema/row-count/null-rate checks on the input data
@@ -55,6 +57,7 @@ TOLERANCES: dict[str, float] = {
     "expected_power_mae_kw": 0.05,
     "latency_p95_ms": 0.50,         # may rise at most 50% relative (noisy on shared CI runners)
     "agent_routing_accuracy": 0.0,  # must not drop at all
+    "investigation_verified_rate": 0.0,  # every golden investigation must stay verified
 }
 # Retrieval quality depends on the embedder, so each embedder has its own baseline.
 for _embedder in ("bge", "tfidf"):
@@ -140,6 +143,36 @@ def eval_agent_routing(state: AppState) -> dict[str, Any]:
     }
 
 
+GOLDEN_INVESTIGATIONS: list[tuple[str, str | None]] = [
+    ("investigate wind-02", None),
+    ("is anything wrong at solar-02, and forecast it", None),
+    ("have we seen vibration issues at wind-03 before?", None),
+    ("check solar-01, solar-03 and wind-01", None),
+    # at each site's most suspicious moment, so the conditional log search runs too
+    *((f"investigate {site}", "top_flagged") for site in ("wind-02", "wind-03", "solar-02")),
+]
+
+
+def eval_investigations(state: AppState) -> dict[str, Any]:
+    from agent.investigate import investigate
+
+    verified, failures = 0, []
+    for question, when in GOLDEN_INVESTIGATIONS:
+        as_of = None
+        if when == "top_flagged":
+            moment = state.top_flagged_moment(extract_site_ids(question, [s["site_id"] for s in state.sites])[0])
+            as_of = moment["timestamp"] if moment else None
+        result = investigate(state, question, as_of, allow_llm=False)  # deterministic, no API spend
+        if result["verification"]["passed"]:
+            verified += 1
+        else:
+            failures.append({"question": question, "as_of": as_of, "issues": result["verification"]["issues"]})
+    return {
+        "investigation_verified_rate": round(verified / len(GOLDEN_INVESTIGATIONS), 4),
+        "investigation_failures": failures,
+    }
+
+
 def eval_retrieval(state: AppState) -> dict[str, float]:
     embedder = state.vector_store.info["embedder"]
     return {f"retrieval_{embedder}_{k}": v for k, v in evaluate_retrieval(state.vector_store).items()}
@@ -184,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         **eval_latency(state),
         **eval_agent_routing(state),
         **eval_retrieval(state),
+        **eval_investigations(state),
     }
 
     record = {

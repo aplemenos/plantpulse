@@ -24,5 +24,10 @@ class SearchRequest(BaseModel):
     site_id: str | None = None
 
 
+class InvestigateRequest(BaseModel):
+    question: str
+    as_of: str | None = None  # investigate a past moment instead of the latest data
+
+
 class AgentQueryRequest(BaseModel):
     question: str
