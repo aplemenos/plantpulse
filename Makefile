@@ -1,6 +1,6 @@
 PY ?= python
 
-.PHONY: install data train index pipeline test lint regress baseline bench serve docker mlflow-ui models retrieval
+.PHONY: install data train index pipeline test lint regress baseline bench serve docker mlflow-ui models retrieval mcp mcp-http mcp-inspect
 
 install:
 	$(PY) -m pip install -r requirements-dev.txt
@@ -43,6 +43,15 @@ mlflow-ui:                    ## runs, registered models and agent traces at htt
 
 serve:
 	$(PY) -m uvicorn app.main:app --reload --port 8000
+
+mcp:                          ## MCP server over stdio (Claude Desktop, Claude Code)
+	$(PY) -m agent.mcp_server
+
+mcp-http:                     ## MCP server over streamable HTTP at http://127.0.0.1:8765/mcp
+	$(PY) -m agent.mcp_server --http
+
+mcp-inspect:                  ## open MCP Inspector against the stdio server (needs Node)
+	npx @modelcontextprotocol/inspector $(PY) -m agent.mcp_server
 
 docker:
 	docker compose up --build

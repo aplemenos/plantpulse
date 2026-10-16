@@ -68,7 +68,7 @@ The regression check caught the latency problem and a real agent-routing bug ("h
 | Integrate ML into production pipelines and APIs | `app/` FastAPI service; models load once at startup from the MLflow Model Registry (`@champion`), after a signature check |
 | Optimize latency, throughput, memory | Measured latency fix above; `ml/benchmark_parallel.py` (naive vs vectorized vs process pool, results asserted identical) |
 | Model-serving infrastructure (API, batch, streaming) | REST endpoints, `/predict/batch`, and **SSE `/stream/telemetry`** running live per-event inference |
-| Testing and validation frameworks for ML | `tests/`: feature-skew, leakage, API-contract, registry/promotion, agent and tracing, retrieval citation and verifier and session tests (77) |
+| Testing and validation frameworks for ML | `tests/`: feature-skew, leakage, API-contract, registry/promotion, agent and tracing, retrieval citation and verifier, session and MCP tests (83) |
 | Caching and provenance for models, code and data | Redis/in-process prediction cache; **DVC** for data and artifacts; **MLflow** runs tagged with data hash and git commit, models logged with signatures, `/health` reports which registry version and run each served model came from |
 | CI/CD for model deployment | `.github/workflows/ci.yml`: rebuild from source, then tests, then regression gate, then image build and container smoke test, then deploy |
 | Regression testing to monitor the analytics engine | `ml/regression_check.py`: quality, p95 latency, agent-routing accuracy, retrieval quality and data contract against a committed baseline, with run history for trends |
@@ -120,6 +120,42 @@ Investigations can run inside a conversation (`POST /sessions`, then `POST /sess
 - **Compaction.** After three verbatim turns, older ones are folded into a running summary. The summary is a new event; the original events are never edited or deleted. `GET /sessions/{id}/context` shows exactly what the agent will see next.
 - **Resume.** If a turn is interrupted (crash, deploy, timeout), `POST /sessions/{id}/resume` finishes it from the log, reusing the recorded plan and tool outputs instead of calling the tools again.
 - **Tracing.** Each turn's trace carries the session id, so MLflow groups a conversation's traces together.
+
+## MCP server
+
+`agent/mcp_server.py` exposes the agent to any MCP client (Claude Desktop, Claude Code, MCP Inspector) using the official Python SDK:
+
+| Tool | What it does |
+|---|---|
+| `check_anomaly`, `forecast_power` | one site's current (or `as_of`) state, from the `@champion` models |
+| `search_maintenance_logs` | hybrid search over past incidents, with citable log ids |
+| `investigate` | the plan, execute and verify pipeline; returns `verified`, `issues` and a `session_id` to pass back for follow-ups |
+
+A `plantpulse://sites` resource lists the sites. The tools go through the same code paths as the HTTP API (`agent/tools.dispatch`, `agent/sessions`), so answers, verification and MLflow traces are identical. MCP calls are tagged `agent.entrypoint=mcp` in their traces. Tool errors (an unknown site, say) come back as MCP tool errors, not as successful results that happen to contain an error.
+
+```bash
+make mcp           # stdio
+make mcp-http      # streamable HTTP at http://127.0.0.1:8765/mcp
+make mcp-inspect   # MCP Inspector
+```
+
+For Claude Desktop, add this to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "plantpulse": {
+      "command": "/path/to/plantpulse/.venv/bin/python",
+      "args": ["-m", "agent.mcp_server"],
+      "cwd": "/path/to/plantpulse"
+    }
+  }
+}
+```
+
+or, for Claude Code: `claude mcp add plantpulse -- /path/to/plantpulse/.venv/bin/python -m agent.mcp_server`.
+
+The models load in the background when a client connects, so the handshake doesn't wait on them. A test launches the server as a subprocess and talks to it over stdio, so a stray `print` to stdout, which would corrupt the protocol, fails CI.
 
 ## RAG over maintenance logs
 
@@ -179,7 +215,7 @@ Multi-horizon forecasts with prediction intervals · drift monitoring on live fe
 
 ```
 app/       FastAPI service: registry loader, cache, inference, SSE stream, UI
-agent/     tool specs, orchestrator (tool-use / rule-based), plan-execute-verify pipeline, verifier, sessions, tracing
+agent/     tool specs, orchestrator (tool-use / rule-based), plan-execute-verify pipeline, verifier, sessions, MCP server, tracing
 ml/        data generation, features, training + MLflow registry/promotion, vector store, benchmark, regression gate
 tests/     feature, API-contract and agent tests
 infra/     deployment helpers
