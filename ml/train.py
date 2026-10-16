@@ -54,6 +54,7 @@ from ml.features import (
     add_anomaly_features,
     add_expected_power_features,
     add_forecast_features,
+    physical_expected_power,
 )
 from ml.mlflow_config import REGISTERED_NAMES, TRAINING_EXPERIMENT, tracking_uri, use_experiment
 from ml.promote import promote_if_not_worse
@@ -138,7 +139,7 @@ def train_expected_power(
     model.fit(healthy_train[EXPECTED_POWER_FEATURES], healthy_train["power_kw"])
 
     healthy_test = test_df[(test_df.is_anomaly == 0) & (test_df.is_curtailed == 0)]
-    pred = model.predict(healthy_test[EXPECTED_POWER_FEATURES])
+    pred = physical_expected_power(healthy_test, model.predict(healthy_test[EXPECTED_POWER_FEATURES]))
     mae = mean_absolute_error(healthy_test["power_kw"], pred)
 
     metrics = {"mae_kw": round(float(mae), 3)}
@@ -226,7 +227,7 @@ def main() -> None:
     train_df, test_df = time_split(df)
     expected_power_model, _ = train_expected_power(train_df, test_df)
 
-    expected_power = expected_power_model.predict(df[EXPECTED_POWER_FEATURES])
+    expected_power = physical_expected_power(df, expected_power_model.predict(df[EXPECTED_POWER_FEATURES]))
     df["expected_power_kw"] = expected_power
     df_feat = add_anomaly_features(df, expected_power)
     train_a, test_a = time_split(df_feat)

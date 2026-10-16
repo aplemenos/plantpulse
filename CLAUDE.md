@@ -20,7 +20,7 @@ The data is synthetic and seeded: the whole pipeline rebuilds identically, which
   - `sessions.py`: multi-turn conversations; append-only SQLite event log (`var/sessions.db`), context built from the log, compaction after 3 turns, resume of interrupted turns.
   - `mcp_server.py`: MCP server (FastMCP, `mcp==1.12.4`): the three model tools via `dispatch`, `investigate` via sessions (returns `session_id`), `plantpulse://sites`; stdio or `--http`. No `from __future__ import annotations` there: FastMCP needs real types.
   - `tracing.py`: MLflow tracing setup.
-- `tests/`: 83 tests. `typings/`: local type stubs.
+- `tests/`: 85 tests. `typings/`: local type stubs.
 
 ## Commands
 
@@ -50,6 +50,8 @@ make mlflow-ui   # http://127.0.0.1:5050 (not 5000: AirPlay owns that port on ma
 ## Decisions worth knowing
 
 - Two-stage anomaly detection (expected-power regressor, then a classifier on residuals) so curtailment is not mistaken for a fault.
+- Expected power always goes through `ml.features.physical_expected_power` (zero for solar without irradiance, clipped to [0, 1.02×capacity]), in training and serving alike; call the regressor directly and night residuals drift.
+- Maintenance logs are written from each event's real details (which sensor drifted, by how much, duration, cap), so wind sites never get solar wording and texts don't repeat.
 - Models are saved with skops (not pickle), with `sklearn.tree._tree.Tree` as the only trusted type.
 - The verifier never sees the drafter's reasoning: no self-verification. Unverified answers are returned marked as such, never hidden.
 - Session context is a view built from the log; compaction adds a summary event and never deletes events.

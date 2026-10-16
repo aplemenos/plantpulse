@@ -1,12 +1,14 @@
 import numpy as np
 import pandas as pd
 
+from ml.data_generation import Event, build_maintenance_logs
 from ml.features import (
     ANOMALY_FEATURES,
     FORECAST_FEATURES,
     add_anomaly_features,
     add_expected_power_features,
     add_forecast_features,
+    physical_expected_power,
 )
 
 
@@ -69,3 +71,26 @@ def test_forecast_target_is_shifted_per_site_not_across_sites() -> None:
         # and the last 4 rows of each site have no target (no leakage from the next site)
         assert site["target_power_kw"].iloc[-4:].isna().all()
     assert set(FORECAST_FEATURES).issubset(out.columns)
+
+
+def test_expected_power_is_zero_for_solar_without_sun_and_within_capacity() -> None:
+    df = pd.DataFrame({"is_solar": [1, 1, 0, 0], "irradiance_wm2": [0.0, 500.0, 0.0, 0.0],
+                       "capacity_kw": [2500.0] * 4})
+    out = physical_expected_power(df, np.array([13.5, 1200.0, -4.0, 9000.0]))
+    # night solar -> 0; daytime solar untouched; wind never negative, never above 102% of capacity
+    assert out.tolist() == [0.0, 1200.0, 0.0, 2550.0]
+
+
+def test_maintenance_logs_describe_the_sites_own_equipment_and_event() -> None:
+    t0 = pd.Timestamp("2026-02-01")
+    events: list[Event] = [
+        {"site_id": f"wind-0{i}", "site_type": "wind", "event_type": etype, "start": t0,
+         "end": t0 + pd.Timedelta(hours=10), "sensor": sensor, "magnitude": 5.5}
+        for i, (etype, sensor) in enumerate([("sensor_drift", "wind_speed_ms"), ("inverter_fault", ""),
+                                             ("sensor_drift", "ambient_temp_c")] * 4)
+    ]
+    logs = build_maintenance_logs(events, np.random.default_rng(0))
+    texts = [log["text"].lower() for log in logs]
+    assert not any("irradiance" in t or "pyranometer" in t for t in texts)
+    assert all("anemometer" in t or "wind speed" in t for t in texts[0::3])
+    assert all("temperature" in t for t in texts[2::3])

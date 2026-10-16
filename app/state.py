@@ -26,6 +26,7 @@ from ml.features import (
     add_anomaly_features,
     add_expected_power_features,
     add_forecast_features,
+    physical_expected_power,
 )
 from ml.vector_store import VectorStore
 
@@ -52,7 +53,7 @@ class AppState:
 
         raw = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
         df = add_expected_power_features(raw)
-        expected = self.registry.expected_power.model.predict(df[EXPECTED_POWER_FEATURES])
+        expected = physical_expected_power(df, self.registry.expected_power.model.predict(df[EXPECTED_POWER_FEATURES]))
         df = add_anomaly_features(df, expected)
         df = add_forecast_features(df)
         self.df = df.sort_values(["site_id", "timestamp"]).reset_index(drop=True)

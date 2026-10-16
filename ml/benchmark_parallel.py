@@ -38,6 +38,7 @@ from ml.features import (
     EXPECTED_POWER_FEATURES,
     add_anomaly_features,
     add_expected_power_features,
+    physical_expected_power,
 )
 
 DATA_PATH = ROOT / "data" / "telemetry.csv"
@@ -93,7 +94,7 @@ def _timed(fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> tuple[R, fl
 def main() -> None:
     raw = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
     df = add_expected_power_features(raw)
-    expected = load_champion("expected_power", Regressor).model.predict(df[EXPECTED_POWER_FEATURES])
+    expected = physical_expected_power(df, load_champion("expected_power", Regressor).model.predict(df[EXPECTED_POWER_FEATURES]))
     df = add_anomaly_features(df, expected)
     feat = df[ANOMALY_FEATURES].astype("float64")
 

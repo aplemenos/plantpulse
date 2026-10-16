@@ -40,7 +40,7 @@ from sklearn.metrics import f1_score, mean_absolute_error, precision_score, reca
 from agent.orchestrator import extract_intents, extract_site_ids
 from app.inference import predict_anomaly
 from app.state import AppState
-from ml.features import ANOMALY_FEATURES, EXPECTED_POWER_FEATURES, FORECAST_FEATURES
+from ml.features import ANOMALY_FEATURES, EXPECTED_POWER_FEATURES, FORECAST_FEATURES, physical_expected_power
 from ml.retrieval_eval import evaluate as evaluate_retrieval
 from ml.train import time_split
 
@@ -99,7 +99,7 @@ def eval_quality(state: AppState) -> dict[str, float]:
     y = test["is_anomaly"]
 
     healthy = test[(test.is_anomaly == 0) & (test.is_curtailed == 0)]
-    ep_pred = state.registry.expected_power.model.predict(healthy[EXPECTED_POWER_FEATURES])
+    ep_pred = physical_expected_power(healthy, state.registry.expected_power.model.predict(healthy[EXPECTED_POWER_FEATURES]))
 
     fc = test.dropna(subset=FORECAST_FEATURES + ["target_power_kw"])
     fc_pred = state.registry.forecaster.model.predict(fc[FORECAST_FEATURES])

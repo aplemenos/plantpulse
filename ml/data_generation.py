@@ -53,9 +53,14 @@ FloatArray = NDArray[np.float64]
 
 class Event(TypedDict):
     site_id: str
+    site_type: str
     event_type: str
     start: pd.Timestamp
     end: pd.Timestamp
+    # What actually happened, so the maintenance log describes this event and not a generic one:
+    # the drifted column (sensor_drift), and the fault severity, drift size or output cap.
+    sensor: str
+    magnitude: float
 
 
 class MaintenanceLog(TypedDict):
@@ -143,6 +148,7 @@ def _inject_events(df: pd.DataFrame, site: Site, rng: np.random.Generator) -> li
 
     for _ in range(n_events):
         etype = str(rng.choice(event_types))
+        sensor, magnitude = "", 0.0
         start_idx = int(rng.integers(STEPS_PER_DAY * 2, n - STEPS_PER_DAY * 6))
         duration_steps = int(rng.integers(STEPS_PER_DAY // 2, STEPS_PER_DAY * 3))
         end_idx = min(start_idx + duration_steps, n - 1)
@@ -150,22 +156,28 @@ def _inject_events(df: pd.DataFrame, site: Site, rng: np.random.Generator) -> li
 
         if etype == "inverter_fault":
             severity = rng.uniform(0.35, 0.75)
+            magnitude = float(severity)
             df.loc[df.index[sl], "power_kw"] *= 1 - severity
             df.loc[df.index[sl], "is_anomaly"] = 1
         elif etype == "sensor_drift":
             drift_col = "ambient_temp_c" if rng.random() < 0.5 else "irradiance_wm2" if site.site_type == "solar" else "wind_speed_ms"
-            ramp = np.linspace(0, rng.uniform(4, 9), end_idx - start_idx)
+            drift = rng.uniform(4, 9)
+            sensor, magnitude = drift_col, float(drift)
+            ramp = np.linspace(0, drift, end_idx - start_idx)
             df.loc[df.index[sl], drift_col] = df.loc[df.index[sl], drift_col].to_numpy(dtype=np.float64) + ramp
             df.loc[df.index[sl], "is_anomaly"] = 1
         elif etype == "curtailment":
             cap_fraction = rng.uniform(0.3, 0.6)
+            magnitude = float(cap_fraction)
             df.loc[df.index[sl], "power_kw"] = np.minimum(
                 df.loc[df.index[sl], "power_kw"].to_numpy(dtype=np.float64), site.capacity_kw * cap_fraction
             )
             df.loc[df.index[sl], "is_curtailed"] = 1
             # curtailment is NOT labeled an anomaly - it's intentional
         elif etype == "mechanical_wear":
-            ramp = np.linspace(0, rng.uniform(3, 6), end_idx - start_idx)
+            rise = rng.uniform(3, 6)
+            magnitude = float(rise)
+            ramp = np.linspace(0, rise, end_idx - start_idx)
             df.loc[df.index[sl], "vibration_mm_s"] = df.loc[df.index[sl], "vibration_mm_s"].to_numpy(dtype=np.float64) + ramp
             df.loc[df.index[sl], "power_kw"] *= np.linspace(1.0, 0.85, end_idx - start_idx)
             df.loc[df.index[sl], "is_anomaly"] = 1
@@ -173,9 +185,12 @@ def _inject_events(df: pd.DataFrame, site: Site, rng: np.random.Generator) -> li
         events.append(
             {
                 "site_id": site.site_id,
+                "site_type": site.site_type,
                 "event_type": etype,
                 "start": pd.Timestamp(df["timestamp"].iloc[start_idx]),
                 "end": pd.Timestamp(df["timestamp"].iloc[end_idx]),
+                "sensor": sensor,
+                "magnitude": magnitude,
             }
         )
     return events
@@ -225,41 +240,72 @@ def generate_site_telemetry(site: Site) -> tuple[pd.DataFrame, list[Event]]:
     return df, events
 
 
-MAINTENANCE_TEMPLATES = {
+# Templates are chosen by what the event actually was (site type, which sensor drifted), and
+# filled with the event's own numbers, so a log never describes equipment the site does not have
+# and two incidents rarely read the same. Fields: {inv} unit number, {pct} output loss,
+# {drift} sensor drift, {rise} vibration rise, {hours} duration, {cap} output cap, {resource}.
+MAINTENANCE_TEMPLATES: dict[str, list[str]] = {
     "inverter_fault": [
-        "Found loose DC connector on inverter {inv}; intermittent output drop resolved after reseating and torque check.",
-        "Inverter {inv} tripped on internal over-temperature fault; cleaned heatsink and replaced cooling fan.",
-        "Replaced failed IGBT module on inverter {inv} after repeated output derating under normal irradiance.",
+        ("Found loose DC connector on inverter {inv}; intermittent output drops of up to {pct}% resolved after "
+        "reseating and torque check."),
+        ("Inverter {inv} tripped on internal over-temperature fault after {hours}h of derated output; cleaned "
+        "heatsink and replaced cooling fan."),
+        "Replaced failed IGBT module on inverter {inv} after output derated by ~{pct}% under normal {resource}.",
     ],
-    "sensor_drift": [
-        "Recalibrated ambient temperature sensor at site; reading had drifted ~6C high over two weeks.",
-        "Irradiance sensor showed drift vs. reference pyranometer; cleaned lens and recalibrated.",
-        "Replaced corroded sensor cable causing gradual drift in reported measurement.",
+    "sensor_drift:ambient_temp_c": [
+        "Recalibrated ambient temperature sensor; reading had drifted ~{drift}C high over {hours}h.",
+        "Replaced corroded temperature sensor cable; ambient reading had crept ~{drift}C above the reference.",
+    ],
+    "sensor_drift:irradiance_wm2": [
+        "Irradiance sensor read ~{drift} W/m2 above the reference pyranometer; cleaned lens and recalibrated.",
+        "Replaced corroded pyranometer cable causing gradual drift in reported irradiance (~{drift} W/m2 high).",
+    ],
+    "sensor_drift:wind_speed_ms": [
+        "Nacelle anemometer drifted ~{drift} m/s above the met-mast reference; replaced bearings and recalibrated.",
+        "Replaced corroded anemometer cable causing gradual drift in reported wind speed (~{drift} m/s high).",
     ],
     "mechanical_wear": [
-        "Vibration trend on turbine {inv} gearbox exceeded threshold; borescope inspection found early bearing wear, scheduled replacement.",
-        "Increasing nacelle vibration correlated with falling output; greased main bearing and tightened mounting bolts.",
+        ("Vibration on turbine {inv} gearbox rose ~{rise} mm/s above baseline; borescope inspection found early "
+        "bearing wear, scheduled replacement."),
+        ("Increasing nacelle vibration (+{rise} mm/s) correlated with falling output; greased main bearing and "
+        "tightened mounting bolts."),
     ],
     "curtailment": [
-        "Grid operator issued curtailment order for {hours}h due to local grid congestion; no equipment fault.",
-        "Voluntary output cap applied during low-price market window per dispatch instructions; equipment healthy.",
+        ("Grid operator issued curtailment order for {hours}h (cap {cap}% of capacity) due to local grid "
+        "congestion; no equipment fault."),
+        ("Voluntary output cap at {cap}% of capacity for {hours}h during low-price market window per dispatch "
+        "instructions; equipment healthy."),
     ],
 }
+
+
+def log_text(ev: Event, rng: np.random.Generator) -> str:
+    """One maintenance-log sentence describing this event, with its real numbers."""
+    key = f"sensor_drift:{ev['sensor']}" if ev["event_type"] == "sensor_drift" else ev["event_type"]
+    templates = MAINTENANCE_TEMPLATES[key]
+    template = templates[int(rng.integers(0, len(templates)))]
+    magnitude = ev["magnitude"]
+    return template.format(
+        inv=int(rng.integers(1, 5)),
+        hours=max(1, round((ev["end"] - ev["start"]).total_seconds() / 3600)),
+        pct=round(magnitude * 100),
+        cap=round(magnitude * 100),
+        drift=round(magnitude, 1),
+        rise=round(magnitude, 1),
+        resource="irradiance" if ev["site_type"] == "solar" else "wind",
+    )
 
 
 def build_maintenance_logs(all_events: list[Event], rng: np.random.Generator) -> list[MaintenanceLog]:
     logs: list[MaintenanceLog] = []
     for i, ev in enumerate(all_events):
-        templates = MAINTENANCE_TEMPLATES[ev["event_type"]]
-        template = templates[int(rng.integers(0, len(templates)))]
-        text = template.format(inv=f"{rng.integers(1, 5)}", hours=int(rng.integers(2, 10)))
         logs.append(
             {
                 "log_id": f"log-{i:04d}",
                 "site_id": ev["site_id"],
                 "event_type": ev["event_type"],
                 "date": str(ev["end"].date()),
-                "text": f"{ev['end'].date()} — Site {ev['site_id']}: {text}",
+                "text": f"{ev['end'].date()} — Site {ev['site_id']}: {log_text(ev, rng)}",
             }
         )
     return logs

@@ -1,8 +1,8 @@
 {
-  "anomaly_precision": 0.808,
-  "anomaly_recall": 0.5663,
-  "anomaly_f1": 0.6659,
-  "expected_power_mae_kw": 17.286,
+  "anomaly_precision": 0.8134,
+  "anomaly_recall": 0.5656,
+  "anomaly_f1": 0.6672,
+  "expected_power_mae_kw": 16.763,
   "forecast_mae_kw": 54.389,
   "latency_p95_ms": 12.66,
   "agent_routing_accuracy": 1.0,
@@ -11,6 +11,6 @@
   "retrieval_tfidf_mrr": 0.9375,
   "retrieval_bge_hit_at_3": 0.9375,
   "retrieval_bge_precision_at_3": 0.7917,
-  "retrieval_bge_mrr": 0.9375,
+  "retrieval_bge_mrr": 0.8958,
   "investigation_verified_rate": 1.0
 }

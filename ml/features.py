@@ -33,6 +33,15 @@ EXPECTED_POWER_FEATURES = [
 ]
 
 
+def physical_expected_power(df: pd.DataFrame, predicted: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Apply physics the regressor only approximates: a solar site with no irradiance produces nothing
+    (the model otherwise predicts ~10 kW at night), and power is never negative or above capacity.
+    Every caller of the expected-power model goes through this, in training and serving alike."""
+    no_sun = (df["is_solar"].to_numpy() == 1) & (df["irradiance_wm2"].to_numpy() <= 0)
+    clipped = np.clip(predicted, 0.0, df["capacity_kw"].to_numpy(dtype=np.float64) * 1.02)
+    return np.where(no_sun, 0.0, clipped)
+
+
 def add_anomaly_features(df: pd.DataFrame, expected_power: NDArray[np.float64]) -> pd.DataFrame:
     """Residual + drift/vibration features used by the anomaly classifier.
 
