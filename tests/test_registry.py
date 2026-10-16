@@ -90,4 +90,4 @@ def test_anomaly_probabilities_are_calibrated(client: TestClient) -> None:
     proba = get_state().registry.anomaly_detector.model.predict_proba(df[ANOMALY_FEATURES])[:, 1]
     healthy = ((df["is_anomaly"] == 0) & (df["is_curtailed"] == 0)).to_numpy()
     assert proba[healthy].mean() < 0.1
-    assert proba[~healthy & (df["is_anomaly"] == 1).to_numpy()].mean() > 0.3
+    assert proba[(df["is_anomaly"] == 1).to_numpy()].mean() > 0.3

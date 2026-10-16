@@ -20,7 +20,7 @@ The data is synthetic and seeded: the whole pipeline rebuilds identically, which
   - `sessions.py`: multi-turn conversations; append-only SQLite event log (`var/sessions.db`), context built from the log, compaction after 3 turns, resume of interrupted turns.
   - `mcp_server.py`: MCP server (FastMCP, `mcp==1.12.4`): the three model tools via `dispatch`, `investigate` via sessions (returns `session_id`), `plantpulse://sites`; stdio or `--http`. No `from __future__ import annotations` there: FastMCP needs real types.
   - `tracing.py`: MLflow tracing setup.
-- `tests/`: 85 tests. `typings/`: local type stubs.
+- `tests/`: 86 tests. `typings/`: local type stubs.
 
 ## Commands
 
@@ -41,7 +41,7 @@ make mlflow-ui   # http://127.0.0.1:5050 (not 5000: AirPlay owns that port on ma
 ## Conventions
 
 - Pyright strict and ruff must stay at zero findings; add stubs to `typings/` rather than ignoring errors.
-- Every change keeps `make test` and `make regress` green. The gate covers model quality, p95 latency, agent routing, retrieval (per embedder), and the share of golden investigations that pass the verifier (must be 1.0).
+- Every change keeps `make test` and `make regress` green. The gate covers model quality (including the anomaly Brier score), p95 latency, agent routing, retrieval (per embedder), and the share of golden investigations that pass the verifier (must be 1.0).
 - Tests never call the real Anthropic API: `conftest.py` removes `ANTHROPIC_API_KEY`; LLM paths are tested with a scripted fake client. The regression gate runs investigations with `allow_llm=False`.
 - `mcp` is pinned to 1.x: 2.x requires starlette>=1, which needs a FastAPI upgrade first.
 - Never commit secrets (`.env`, API keys). `var/`, `.cache/`, `mlruns/` are ignored.
@@ -52,7 +52,8 @@ make mlflow-ui   # http://127.0.0.1:5050 (not 5000: AirPlay owns that port on ma
 - Two-stage anomaly detection (expected-power regressor, then a classifier on residuals) so curtailment is not mistaken for a fault.
 - Expected power always goes through `ml.features.physical_expected_power` (zero for solar without irradiance, clipped to [0, 1.02×capacity]), in training and serving alike; call the regressor directly and night residuals drift.
 - Maintenance logs are written from each event's real details (which sensor drifted, by how much, duration, cap), so wind sites never get solar wording and texts don't repeat.
-- Models are saved with skops (not pickle), with `sklearn.tree._tree.Tree` as the only trusted type.
+- Models are saved with skops (not pickle). Trusted types: `sklearn.tree._tree.Tree` plus the two private classes of a sigmoid-calibrated classifier (`sklearn.calibration._CalibratedClassifier`, `_SigmoidCalibration`).
+- The anomaly detector is calibrated: an unweighted RandomForest (min_samples_leaf=20) inside `CalibratedClassifierCV(method="sigmoid", cv=5, ensemble=False)`. `class_weight="balanced"` had healthy rows averaging ~0.3 (Brier 0.114); now ~0.03 (Brier 0.049) and 0.5 means "more likely a fault than not". At 0.5, F1 0.667 → 0.671 and precision 0.81 → 0.99, but recall 0.57 → 0.51: the baseline was updated to accept that trade-off. Isotonic needed one fewer trusted type but lost F1. The config was chosen on an inner time split of the training window, not the test set. The fitted forest inside the wrapper is pinned to `n_jobs=1` at training time, because the registry's `set_params` doesn't reach it.
 - The verifier never sees the drafter's reasoning: no self-verification. Unverified answers are returned marked as such, never hidden.
 - Session context is a view built from the log; compaction adds a summary event and never deletes events.
 - With the bge embedder, a curtailment log ending "equipment healthy" once made the verifier reject a correct answer; quoted log text is now stripped before status checks (regression test included).
