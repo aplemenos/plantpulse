@@ -25,7 +25,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # mcp's stdio_client has no return annotation, and editors infer it differently (Pylance sees a plain
 # Generator), so the test states the type it relies on.
-StdioStreams = tuple[MemoryObjectReceiveStream[SessionMessage | Exception], MemoryObjectSendStream[SessionMessage]]
+StdioStreams = tuple[
+    MemoryObjectReceiveStream[SessionMessage | Exception], MemoryObjectSendStream[SessionMessage]
+]
 
 
 @pytest.fixture(scope="module")
@@ -55,7 +57,8 @@ def test_tools_mirror_the_shared_specs(server: FastMCP) -> None:
 
 def test_model_tool_returns_the_same_result_as_dispatch(server: FastMCP) -> None:
     result = call(server, "check_anomaly", {"site_id": "wind-02"})
-    assert result["site_id"] == "wind-02" and {"is_anomaly", "anomaly_probability", "is_curtailed"} <= set(result)
+    assert result["site_id"] == "wind-02"
+    assert {"is_anomaly", "anomaly_probability", "is_curtailed"} <= set(result)
     hits = call(server, "search_maintenance_logs", {"query": "inverter overheating", "k": 2})["results"]
     assert len(hits) == 2 and all(h["log_id"].startswith("log-") for h in hits)
 
@@ -86,7 +89,8 @@ def test_stdio_end_to_end(tmp_path: Path) -> None:
     """The real thing: a client launches the server as a subprocess and talks MCP over stdin/stdout.
     Any stray print to stdout would corrupt the protocol and fail this test."""
     env = {**os.environ, "PLANTPULSE_TRACING": "0", "PLANTPULSE_SESSIONS_DB": str(tmp_path / "s.db")}
-    params = StdioServerParameters(command=sys.executable, args=["-m", "agent.mcp_server"], env=env, cwd=str(ROOT))
+    params = StdioServerParameters(command=sys.executable, args=["-m", "agent.mcp_server"],
+                                   env=env, cwd=str(ROOT))
 
     async def run() -> None:
         transport = cast(AbstractAsyncContextManager[StdioStreams], stdio_client(params))
@@ -102,7 +106,8 @@ def test_stdio_end_to_end(tmp_path: Path) -> None:
             assert not ok.isError and ok.structuredContent and ok.structuredContent["site_id"] == "solar-01"
 
             bad = await session.call_tool("check_anomaly", {"site_id": "nope-99"})
-            assert bad.isError and isinstance(bad.content[0], TextContent) and "no telemetry" in bad.content[0].text
+            assert bad.isError and isinstance(bad.content[0], TextContent)
+            assert "no telemetry" in bad.content[0].text
 
             sites = await session.read_resource(AnyUrl("plantpulse://sites"))
             first = sites.contents[0]

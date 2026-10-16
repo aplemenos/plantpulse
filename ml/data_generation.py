@@ -160,11 +160,13 @@ def _inject_events(df: pd.DataFrame, site: Site, rng: np.random.Generator) -> li
             df.loc[df.index[sl], "power_kw"] *= 1 - severity
             df.loc[df.index[sl], "is_anomaly"] = 1
         elif etype == "sensor_drift":
-            drift_col = "ambient_temp_c" if rng.random() < 0.5 else "irradiance_wm2" if site.site_type == "solar" else "wind_speed_ms"
+            resource_col = "irradiance_wm2" if site.site_type == "solar" else "wind_speed_ms"
+            drift_col = "ambient_temp_c" if rng.random() < 0.5 else resource_col
             drift = rng.uniform(4, 9)
             sensor, magnitude = drift_col, float(drift)
             ramp = np.linspace(0, drift, end_idx - start_idx)
-            df.loc[df.index[sl], drift_col] = df.loc[df.index[sl], drift_col].to_numpy(dtype=np.float64) + ramp
+            readings = df.loc[df.index[sl], drift_col].to_numpy(dtype=np.float64)
+            df.loc[df.index[sl], drift_col] = readings + ramp
             df.loc[df.index[sl], "is_anomaly"] = 1
         elif etype == "curtailment":
             cap_fraction = rng.uniform(0.3, 0.6)
@@ -178,7 +180,8 @@ def _inject_events(df: pd.DataFrame, site: Site, rng: np.random.Generator) -> li
             rise = rng.uniform(3, 6)
             magnitude = float(rise)
             ramp = np.linspace(0, rise, end_idx - start_idx)
-            df.loc[df.index[sl], "vibration_mm_s"] = df.loc[df.index[sl], "vibration_mm_s"].to_numpy(dtype=np.float64) + ramp
+            vibration = df.loc[df.index[sl], "vibration_mm_s"].to_numpy(dtype=np.float64)
+            df.loc[df.index[sl], "vibration_mm_s"] = vibration + ramp
             df.loc[df.index[sl], "power_kw"] *= np.linspace(1.0, 0.85, end_idx - start_idx)
             df.loc[df.index[sl], "is_anomaly"] = 1
 
@@ -246,35 +249,41 @@ def generate_site_telemetry(site: Site) -> tuple[pd.DataFrame, list[Event]]:
 # {drift} sensor drift, {rise} vibration rise, {hours} duration, {cap} output cap, {resource}.
 MAINTENANCE_TEMPLATES: dict[str, list[str]] = {
     "inverter_fault": [
-        ("Found loose DC connector on inverter {inv}; intermittent output drops of up to {pct}% resolved after "
-        "reseating and torque check."),
-        ("Inverter {inv} tripped on internal over-temperature fault after {hours}h of derated output; cleaned "
-        "heatsink and replaced cooling fan."),
-        "Replaced failed IGBT module on inverter {inv} after output derated by ~{pct}% under normal {resource}.",
+        ("Found loose DC connector on inverter {inv}; intermittent output drops of up to {pct}% "
+         "resolved after reseating and torque check."),
+        ("Inverter {inv} tripped on internal over-temperature fault after {hours}h of derated output; "
+         "cleaned heatsink and replaced cooling fan."),
+        ("Replaced failed IGBT module on inverter {inv} after output derated by ~{pct}% "
+         "under normal {resource}."),
     ],
     "sensor_drift:ambient_temp_c": [
         "Recalibrated ambient temperature sensor; reading had drifted ~{drift}C high over {hours}h.",
-        "Replaced corroded temperature sensor cable; ambient reading had crept ~{drift}C above the reference.",
+        ("Replaced corroded temperature sensor cable; ambient reading had crept ~{drift}C "
+         "above the reference."),
     ],
     "sensor_drift:irradiance_wm2": [
-        "Irradiance sensor read ~{drift} W/m2 above the reference pyranometer; cleaned lens and recalibrated.",
-        "Replaced corroded pyranometer cable causing gradual drift in reported irradiance (~{drift} W/m2 high).",
+        ("Irradiance sensor read ~{drift} W/m2 above the reference pyranometer; "
+         "cleaned lens and recalibrated."),
+        ("Replaced corroded pyranometer cable causing gradual drift in reported irradiance "
+         "(~{drift} W/m2 high)."),
     ],
     "sensor_drift:wind_speed_ms": [
-        "Nacelle anemometer drifted ~{drift} m/s above the met-mast reference; replaced bearings and recalibrated.",
-        "Replaced corroded anemometer cable causing gradual drift in reported wind speed (~{drift} m/s high).",
+        ("Nacelle anemometer drifted ~{drift} m/s above the met-mast reference; "
+         "replaced bearings and recalibrated."),
+        ("Replaced corroded anemometer cable causing gradual drift in reported wind speed "
+         "(~{drift} m/s high)."),
     ],
     "mechanical_wear": [
-        ("Vibration on turbine {inv} gearbox rose ~{rise} mm/s above baseline; borescope inspection found early "
-        "bearing wear, scheduled replacement."),
-        ("Increasing nacelle vibration (+{rise} mm/s) correlated with falling output; greased main bearing and "
-        "tightened mounting bolts."),
+        ("Vibration on turbine {inv} gearbox rose ~{rise} mm/s above baseline; borescope inspection "
+         "found early bearing wear, scheduled replacement."),
+        ("Increasing nacelle vibration (+{rise} mm/s) correlated with falling output; "
+         "greased main bearing and tightened mounting bolts."),
     ],
     "curtailment": [
-        ("Grid operator issued curtailment order for {hours}h (cap {cap}% of capacity) due to local grid "
-        "congestion; no equipment fault."),
-        ("Voluntary output cap at {cap}% of capacity for {hours}h during low-price market window per dispatch "
-        "instructions; equipment healthy."),
+        ("Grid operator issued curtailment order for {hours}h (cap {cap}% of capacity) "
+         "due to local grid congestion; no equipment fault."),
+        ("Voluntary output cap at {cap}% of capacity for {hours}h during low-price market window "
+         "per dispatch instructions; equipment healthy."),
     ],
 }
 

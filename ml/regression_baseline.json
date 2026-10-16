@@ -1,7 +1,8 @@
 {
-  "anomaly_precision": 0.8134,
-  "anomaly_recall": 0.5656,
-  "anomaly_f1": 0.6672,
+  "anomaly_precision": 0.9933,
+  "anomaly_recall": 0.5068,
+  "anomaly_f1": 0.6712,
+  "anomaly_brier": 0.049,
   "expected_power_mae_kw": 16.763,
   "forecast_mae_kw": 54.389,
   "latency_p95_ms": 12.66,

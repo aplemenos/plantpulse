@@ -4,8 +4,9 @@ Training entrypoint for PlantPulse's three production models:
   1. expected_power  - GradientBoostingRegressor, predicts "healthy" power
                        output given weather/sensor inputs. Used to compute
                        the residual that drives anomaly detection.
-  2. anomaly_detector - RandomForestClassifier (class_weight=balanced) on
-                       residual + drift/vibration features. Compared
+  2. anomaly_detector - RandomForestClassifier on residual + drift/vibration
+                       features, wrapped in sigmoid (Platt) calibration so
+                       anomaly_probability is a real probability. Compared
                        against a naive static-threshold baseline so the
                        lift from the model is an actual measured number,
                        not an assumption.
@@ -38,8 +39,10 @@ from mlflow import MlflowClient
 from mlflow.models import infer_signature
 from mlflow.sklearn import log_model
 from numpy.typing import NDArray
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier
 from sklearn.metrics import (
+    brier_score_loss,
     f1_score,
     mean_absolute_error,
     precision_score,
@@ -62,9 +65,15 @@ from ml.promote import promote_if_not_worse
 ROOT = Path(__file__).resolve().parent.parent
 DATA_PATH = ROOT / "data" / "telemetry.csv"
 
-# Tree node storage shared by the forests and boosted trees. Trusted because we
-# create these files ourselves in this pipeline.
-SKOPS_TRUSTED_TYPES = ["sklearn.tree._tree.Tree"]
+# Types skops won't load unless told to. Trusted because we create these files
+# ourselves in this pipeline: tree node storage shared by the forests and
+# boosted trees, plus the two private classes a sigmoid-calibrated classifier
+# holds (isotonic would need one fewer, but lost F1 at the 0.5 threshold).
+SKOPS_TRUSTED_TYPES = [
+    "sklearn.tree._tree.Tree",
+    "sklearn.calibration._CalibratedClassifier",
+    "sklearn.calibration._SigmoidCalibration",
+]
 
 
 def _git_commit() -> str:
@@ -88,7 +97,7 @@ def _sha256(path: Path) -> str:
 
 def log_and_register(
     model_key: str,
-    model: GradientBoostingRegressor | RandomForestClassifier,
+    model: GradientBoostingRegressor | CalibratedClassifierCV,
     X_example: pd.DataFrame,
     params: dict[str, Any],
     metrics: dict[str, float],
@@ -157,16 +166,31 @@ def _naive_anomaly_baseline(df: pd.DataFrame, threshold: float = -0.2) -> NDArra
     return flagged.to_numpy(dtype=np.int64)
 
 
+def expected_calibration_error(y_true: pd.Series[Any], proba: NDArray[np.float64], n_bins: int = 10) -> float:
+    """Mean gap between predicted probability and observed anomaly rate, over equal-count bins."""
+    observed, predicted = calibration_curve(y_true, proba, n_bins=n_bins, strategy="quantile")
+    return float(np.mean(np.abs(observed - predicted)))
+
+
 def train_anomaly_detector(
     train_df: pd.DataFrame, test_df: pd.DataFrame
-) -> tuple[RandomForestClassifier, dict[str, float], dict[str, float]]:
+) -> tuple[CalibratedClassifierCV, dict[str, float], dict[str, float]]:
     X_train, y_train = train_df[ANOMALY_FEATURES], train_df["is_anomaly"]
     X_test, y_test = test_df[ANOMALY_FEATURES], test_df["is_anomaly"]
 
-    model = RandomForestClassifier(
-        n_estimators=300, max_depth=8, class_weight="balanced", random_state=42, n_jobs=-1
-    )
+    # No class weighting: class_weight="balanced" pushed healthy rows to ~0.3, so
+    # 0.4 read as alarming when nothing was wrong. Sigmoid calibration on
+    # out-of-fold predictions (ensemble=False: one forest fitted on all the
+    # training data, plus a calibrator) makes the score a probability, and
+    # 0.5 means "more likely a fault than not". Chosen on an inner time split
+    # of the training window: better F1 and Brier than the balanced forest.
+    forest = RandomForestClassifier(n_estimators=300, min_samples_leaf=20, random_state=42, n_jobs=-1)
+    model = CalibratedClassifierCV(forest, method="sigmoid", cv=5, ensemble=False)
     model.fit(X_train, y_train)
+    # The service scores one row at a time; the fitted forest lives inside the
+    # wrapper, where the registry's set_params(n_jobs=1) doesn't reach it.
+    for calibrated in model.calibrated_classifiers_:
+        calibrated.estimator.set_params(n_jobs=1)
 
     pred = model.predict(X_test)
     proba = model.predict_proba(X_test)[:, 1]
@@ -175,6 +199,9 @@ def train_anomaly_detector(
         "recall": round(float(recall_score(y_test, pred)), 3),
         "f1": round(float(f1_score(y_test, pred)), 3),
         "roc_auc": round(float(roc_auc_score(y_test, proba)), 3),
+        "brier": round(float(brier_score_loss(y_test, proba)), 4),
+        "ece": round(expected_calibration_error(y_test, proba), 4),
+        "healthy_mean_proba": round(float(proba[(y_test == 0).to_numpy()].mean()), 4),
     }
 
     naive_pred = _naive_anomaly_baseline(test_df)
@@ -187,7 +214,7 @@ def train_anomaly_detector(
     print(f"[eval] anomaly_detector  model={model_metrics}  naive_baseline={baseline_metrics}")
     log_and_register(
         "anomaly_detector", model, X_train.head(200),
-        {"n_estimators": 300, "max_depth": 8, "class_weight": "balanced"},
+        {"n_estimators": 300, "min_samples_leaf": 20, "calibration": "sigmoid", "calibration_cv": 5},
         {**model_metrics, **{f"baseline_{k}": v for k, v in baseline_metrics.items()}},
     )
     return model, model_metrics, baseline_metrics

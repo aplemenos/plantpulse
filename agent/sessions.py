@@ -91,7 +91,8 @@ class SessionStore:
 
     def exists(self, session_id: str) -> bool:
         with self._lock:
-            return self._db.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is not None
+            row = self._db.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            return row is not None
 
     def emit(self, session_id: str, kind: str, payload: dict[str, Any]) -> int:
         """Append one event; it is committed before this returns, so it survives a crash."""
@@ -114,7 +115,8 @@ class SessionStore:
                 "WHERE session_id = ? AND seq >= ? AND seq < ? ORDER BY seq",
                 (session_id, start, end if end is not None else 2**62),
             ).fetchall()
-        return [{"session_id": r[0], "seq": r[1], "type": r[2], "payload": json.loads(r[3]), "created_at": r[4]}
+        return [{"session_id": r[0], "seq": r[1], "type": r[2], "payload": json.loads(r[3]),
+                 "created_at": r[4]}
                 for r in rows]
 
 
@@ -134,7 +136,8 @@ class PendingTurn(TypedDict):
 
 
 def _turns(events: list[Event]) -> tuple[list[Turn], PendingTurn | None, Context]:
-    """Replay the log: completed turns, the unfinished one (if any), and the focus of the last answered turn."""
+    """Replay the log: completed turns, the unfinished one (if any), and the focus of the last answered
+    turn."""
     turns: list[Turn] = []
     current: PendingTurn | None = None
     focus = empty_context()
@@ -150,9 +153,11 @@ def _turns(events: list[Event]) -> tuple[list[Turn], PendingTurn | None, Context
             current["plan"] = cast(list[PlanStep], p["plan"])
             plan_focus = (cast(list[str], p["sites"]), cast(list[str], p["intents"]))
         elif e["type"] == "tool_call":
-            current["done"][step_key(str(p["tool"]), cast(dict[str, Any], p["input"]))] = cast(dict[str, Any], p["output"])
+            key = step_key(str(p["tool"]), cast(dict[str, Any], p["input"]))
+            current["done"][key] = cast(dict[str, Any], p["output"])
         elif e["type"] == "answer":
-            turns.append({"turn": current["turn"], "question": current["question"], "answer": str(p["answer"])})
+            turns.append({"turn": current["turn"], "question": current["question"],
+                          "answer": str(p["answer"])})
             focus["sites"], focus["intents"] = plan_focus
             current = None
     return turns, current, focus
@@ -211,13 +216,14 @@ def resume(state: AppState, store: SessionStore, session_id: str, allow_llm: boo
     if pending is None:
         raise NothingToResume(f"session {session_id} has no unfinished turn")
     context = build_context(events)
-    return _run_turn(state, store, session_id, pending["turn"], pending["question"], pending["as_of"], context,
-                     pending["plan"], pending["done"], allow_llm)
+    return _run_turn(state, store, session_id, pending["turn"], pending["question"], pending["as_of"],
+                     context, pending["plan"], pending["done"], allow_llm)
 
 
 def _run_turn(
     state: AppState, store: SessionStore, session_id: str, turn: int, question: str, as_of: str | None,
-    context: Context, prior_plan: list[PlanStep] | None, done: dict[str, dict[str, Any]] | None, allow_llm: bool,
+    context: Context, prior_plan: list[PlanStep] | None, done: dict[str, dict[str, Any]] | None,
+    allow_llm: bool,
 ) -> dict[str, Any]:
     result = investigate(
         state, question, as_of, allow_llm,

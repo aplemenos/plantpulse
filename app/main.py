@@ -19,7 +19,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
 
-from agent.sessions import NothingToResume, SessionStore, UnknownSession, build_context, investigate_in_session, resume
+from agent.sessions import (
+    NothingToResume,
+    SessionStore,
+    UnknownSession,
+    build_context,
+    investigate_in_session,
+    resume,
+)
 from agent.tracing import ensure_tracing, flush_traces, tracing_enabled
 from app.inference import (
     NotEnoughData,

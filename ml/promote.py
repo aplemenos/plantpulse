@@ -62,8 +62,10 @@ def promote_if_not_worse(client: MlflowClient, model_key: str, new_version: str)
 
     if promote:
         client.set_registered_model_alias(name, CHAMPION_ALIAS, new_version)
-    client.set_model_version_tag(name, new_version, "promotion", ("promoted: " if promote else "rejected: ") + reason)
-    print(f"[registry] {name} v{new_version}: {'promoted to @champion' if promote else 'kept as challenger'} ({reason})")
+    verdict = ("promoted: " if promote else "rejected: ") + reason
+    client.set_model_version_tag(name, new_version, "promotion", verdict)
+    outcome = "promoted to @champion" if promote else "kept as challenger"
+    print(f"[registry] {name} v{new_version}: {outcome} ({reason})")
     return promote
 
 
@@ -81,7 +83,9 @@ def list_versions(client: MlflowClient) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("model", nargs="?", choices=sorted(REGISTERED_NAMES), help="model to re-point")
     parser.add_argument("version", nargs="?", help="registry version to make @champion")
     args = parser.parse_args(argv)

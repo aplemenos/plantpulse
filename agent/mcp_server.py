@@ -112,7 +112,9 @@ def _model_tool(backend: Backend, name: str, inputs: dict[str, Any]) -> dict[str
     return result
 
 
-def _investigate(backend: Backend, question: str, as_of: str | None, session_id: str | None) -> dict[str, Any]:
+def _investigate(
+    backend: Backend, question: str, as_of: str | None, session_id: str | None
+) -> dict[str, Any]:
     sessions = backend.sessions()
     sid = session_id or sessions.create()
     try:
@@ -157,7 +159,9 @@ def build_server(backend: Backend | None = None, host: str = "127.0.0.1", port: 
     async def search_maintenance_logs(
         query: Annotated[str, Field(description=_param("search_maintenance_logs", "query"))],
         k: Annotated[int, Field(ge=1, le=20, description=_param("search_maintenance_logs", "k"))] = 3,
-        site_id: Annotated[str | None, Field(description=_param("search_maintenance_logs", "site_id"))] = None,
+        site_id: Annotated[
+            str | None, Field(description=_param("search_maintenance_logs", "site_id"))
+        ] = None,
     ) -> dict[str, Any]:
         inputs = {"query": query, "k": k, **({"site_id": site_id} if site_id else {})}
         return await anyio.to_thread.run_sync(_model_tool, backend, "search_maintenance_logs", inputs)
@@ -174,9 +178,12 @@ def build_server(backend: Backend | None = None, host: str = "127.0.0.1", port: 
     )
     async def investigate(
         question: Annotated[str, Field(description="Plain-English question about one or more sites")],
-        as_of: Annotated[str | None, Field(description="Optional ISO timestamp to investigate a past moment")] = None,
-        session_id: Annotated[str | None, Field(description="From an earlier investigate call, to ask a follow-up")]
-        = None,
+        as_of: Annotated[
+            str | None, Field(description="Optional ISO timestamp to investigate a past moment")
+        ] = None,
+        session_id: Annotated[
+            str | None, Field(description="From an earlier investigate call, to ask a follow-up")
+        ] = None,
     ) -> dict[str, Any]:
         inputs = {"question": question, "as_of": as_of, "session_id": session_id}
         return await anyio.to_thread.run_sync(

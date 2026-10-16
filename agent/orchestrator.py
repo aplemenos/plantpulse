@@ -56,7 +56,8 @@ brackets, e.g. [log-0009]. Only cite logs returned by search_maintenance_logs, a
 plainly if no similar incident was found. Keep answers short and concrete."""
 
 _HISTORY_RE = re.compile(
-    r"\bseen\b.*\bbefore\b|\bsimilar\b|\bhistory\b|\blogs?\b|\bmaintenance\b|\bpast incidents?\b|\bhappened before\b",
+    r"\bseen\b.*\bbefore\b|\bsimilar\b|\bhistory\b|\blogs?\b|\bmaintenance\b"
+    r"|\bpast incidents?\b|\bhappened before\b",
     re.IGNORECASE,
 )
 
@@ -197,12 +198,12 @@ def _llm_answer(state: AppState, question: str, api_key: str) -> AgentAnswer:
             tool_input = cast(dict[str, Any], block.input)  # validated by the tool's input_schema
             result = dispatch(state, block.name, tool_input)
             tool_calls.append({"tool": block.name, "input": tool_input, "output": result})
-            tool_results.append(
-                {"type": "tool_result", "tool_use_id": block.id, "content": format_tool_result(block.name, result)}
-            )
+            tool_results.append({"type": "tool_result", "tool_use_id": block.id,
+                                 "content": format_tool_result(block.name, result)})
         messages.append({"role": "user", "content": tool_results})
 
-    return {"answer": "(agent loop exceeded max turns without a final answer)", "tool_calls": tool_calls, "mode": "llm"}
+    return {"answer": "(agent loop exceeded max turns without a final answer)",
+            "tool_calls": tool_calls, "mode": "llm"}
 
 
 def _answer(state: AppState, question: str) -> AgentAnswer:
@@ -236,8 +237,10 @@ def answer_question(state: AppState, question: str) -> AgentAnswer:
     with mlflow.start_span(name="agent_query", span_type=SpanType.AGENT) as span:
         span.set_inputs({"question": question})
         result = _answer(state, question)
-        result["citations"], result["unsupported_citations"] = check_citations(result["answer"], result["tool_calls"])
-        span.set_outputs({"answer": result["answer"], "mode": result["mode"], "citations": result["citations"]})
+        cited, unsupported = check_citations(result["answer"], result["tool_calls"])
+        result["citations"], result["unsupported_citations"] = cited, unsupported
+        span.set_outputs({"answer": result["answer"], "mode": result["mode"],
+                          "citations": result["citations"]})
         if result["unsupported_citations"]:
             span.set_attribute("unsupported_citations", result["unsupported_citations"])
         span.set_attribute("tool_call_count", len(result["tool_calls"]))

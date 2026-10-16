@@ -139,7 +139,8 @@ def rule_based_plan(state: AppState, question: str, context: Context | None = No
                          "reason": "the question asks about past incidents", "condition": "always"})
         else:
             plan.append({"tool": "search_maintenance_logs", "input": history,
-                         "reason": "look for precedents if something is wrong", "condition": f"anomalous:{site_id}"})
+                         "reason": "look for precedents if something is wrong",
+                         "condition": f"anomalous:{site_id}"})
     return plan
 
 
@@ -184,7 +185,8 @@ def execute(
     done: dict[str, dict[str, Any]] | None = None,
     on_step: Callable[[StepResult], object] | None = None,
 ) -> list[StepResult]:
-    """Run the plan. Outputs in `done` (from an interrupted run) are reused instead of calling the tool again."""
+    """Run the plan. Outputs in `done` (from an interrupted run) are reused instead of calling the tool
+    again."""
     done = done or {}
     anomalous: dict[str, bool] = {}
     results: list[StepResult] = []
@@ -200,8 +202,9 @@ def execute(
         output = done[key] if reused else dispatch(state, step["tool"], step["input"])
         if step["tool"] == "check_anomaly" and "error" not in output:
             anomalous[step["input"]["site_id"]] = bool(output["is_anomaly"]) and not output["is_curtailed"]
-        result: StepResult = {"tool": step["tool"], "input": step["input"], "output": output, "skipped": False,
-                              "reused": reused, "note": "reused from the session log" if reused else ""}
+        result: StepResult = {"tool": step["tool"], "input": step["input"], "output": output,
+                              "skipped": False, "reused": reused,
+                              "note": "reused from the session log" if reused else ""}
         results.append(result)
         if on_step is not None and not reused:
             on_step(result)
@@ -216,7 +219,8 @@ def focus_of(plan: list[PlanStep]) -> tuple[list[str], list[str]]:
 
 
 def evidence_of(results: list[StepResult]) -> Evidence:
-    return [{"tool": r["tool"], "input": r["input"], "output": r["output"]} for r in results if not r["skipped"]]
+    return [{"tool": r["tool"], "input": r["input"], "output": r["output"]}
+            for r in results if not r["skipped"]]
 
 
 def format_results(results: list[StepResult]) -> str:
@@ -228,7 +232,9 @@ def format_results(results: list[StepResult]) -> str:
     return "\n\n".join(blocks)
 
 
-def template_draft(question: str, results: list[StepResult], issues: list[Issue], context: Context | None = None) -> str:
+def template_draft(
+    question: str, results: list[StepResult], issues: list[Issue], context: Context | None = None
+) -> str:
     """Offline drafter: states only what the tools returned."""
     parts: list[str] = []
     for r in results:
@@ -256,7 +262,8 @@ def template_draft(question: str, results: list[StepResult], issues: list[Issue]
         elif r["tool"] == "search_maintenance_logs":
             hits = cast(list[dict[str, Any]], out.get("results", []))
             if hits:
-                parts.append(f"Past incidents at {site}: " + " ".join(f"[{h['log_id']}] {h['text']}" for h in hits))
+                cited = " ".join(f"[{h['log_id']}] {h['text']}" for h in hits)
+                parts.append(f"Past incidents at {site}: {cited}")
             else:
                 parts.append(f"No maintenance history found for {site}.")
     return " ".join(parts) or "I couldn't tell which site you mean - try naming one, e.g. wind-02."
@@ -319,7 +326,9 @@ SUBMIT_VERDICT: dict[str, Any] = {
 }
 
 
-def _forced_tool_input(client: Any, model: str, system: str, tool: dict[str, Any], content: str) -> dict[str, Any]:
+def _forced_tool_input(
+    client: Any, model: str, system: str, tool: dict[str, Any], content: str
+) -> dict[str, Any]:
     from anthropic.types import ToolUseBlock
 
     response = client.messages.create(
@@ -344,9 +353,10 @@ def llm_roles(api_key: str) -> tuple[Planner, Drafter, Judge]:
         sites = ", ".join(s["site_id"] for s in state.sites)
         content = f"Question: {question}\n\nKnown sites: {sites}\n\nTools:\n{tool_list}"
         if history := context_text(context):
-            content = f"{history}\n\nResolve references like 'it' or 'and wind-03?' using the conversation.\n\n{content}"
-        return cast(list[dict[str, Any]],
-                    _forced_tool_input(client, planner_model(), PLANNER_PROMPT, SUBMIT_PLAN, content).get("steps", []))
+            resolve = "Resolve references like 'it' or 'and wind-03?' using the conversation."
+            content = f"{history}\n\n{resolve}\n\n{content}"
+        plan = _forced_tool_input(client, planner_model(), PLANNER_PROMPT, SUBMIT_PLAN, content)
+        return cast(list[dict[str, Any]], plan.get("steps", []))
 
     def draft(question: str, results: list[StepResult], issues: list[Issue], context: Context) -> str:
         content = f"Question: {question}\n\nTool results:\n{format_results(results)}"
@@ -362,7 +372,8 @@ def llm_roles(api_key: str) -> tuple[Planner, Drafter, Judge]:
         return "".join(b.text for b in response.content if isinstance(b, TextBlock))
 
     def judge(question: str, results: list[StepResult], answer: str) -> list[Issue]:
-        content = f"Question: {question}\n\nTool results:\n{format_results(results)}\n\nAnswer to verify:\n{answer}"
+        content = (f"Question: {question}\n\nTool results:\n{format_results(results)}\n\n"
+                   f"Answer to verify:\n{answer}")
         verdict = _forced_tool_input(client, verifier_model(), JUDGE_PROMPT, SUBMIT_VERDICT, content)
         return [{"check": "judge", "detail": str(d)} for d in cast(list[Any], verdict.get("issues", []))]
 
@@ -472,7 +483,8 @@ def investigate(
 
             try:
                 plan, draft, judge = llm_roles(api_key)
-                result = run_pipeline(state, question, plan, draft, judge, as_of, context, sink, prior_plan, done)
+                result = run_pipeline(state, question, plan, draft, judge, as_of, context, sink,
+                                      prior_plan, done)
                 result["mode"] = "llm"
                 result["models"] = {"planner": planner_model(), "executor": executor_model(),
                                     "verifier": verifier_model()}

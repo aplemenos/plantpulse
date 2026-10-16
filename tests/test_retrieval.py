@@ -42,7 +42,8 @@ def test_hybrid_returns_k_unique_logs(store: VectorStore) -> None:
 
 def test_hybrid_is_not_worse_than_either_ranking_alone_on_first_hits(store: VectorStore) -> None:
     hybrid = evaluate(store, "hybrid")
-    assert hybrid["hit_at_3"] >= max(evaluate(store, "vector")["hit_at_3"], evaluate(store, "bm25")["hit_at_3"])
+    best_single = max(evaluate(store, "vector")["hit_at_3"], evaluate(store, "bm25")["hit_at_3"])
+    assert hybrid["hit_at_3"] >= best_single
 
 
 class _FakeTextEmbedding:

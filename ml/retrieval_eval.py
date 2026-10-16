@@ -35,22 +35,38 @@ class GoldenQuery(TypedDict):
 
 
 GOLDEN_RETRIEVAL: list[GoldenQuery] = [
-    {"query": "inverter shut itself down because it was running too hot", "event_type": "inverter_fault", "site_id": None},
-    {"query": "power keeps cutting in and out, maybe a bad cable connection", "event_type": "inverter_fault", "site_id": None},
-    {"query": "output limited even though the sun is strong", "event_type": "inverter_fault", "site_id": None},
-    {"query": "failed power electronics module in the inverter", "event_type": "inverter_fault", "site_id": None},
-    {"query": "grid operator asked us to reduce output", "event_type": "curtailment", "site_id": None},
-    {"query": "we capped production because electricity prices were low", "event_type": "curtailment", "site_id": None},
-    {"query": "low output was intentional, not a fault", "event_type": "curtailment", "site_id": None},
-    {"query": "temperature reading is a few degrees off", "event_type": "sensor_drift", "site_id": None},
-    {"query": "readings slowly wandering away from the true value", "event_type": "sensor_drift", "site_id": None},
-    {"query": "pyranometer disagrees with our irradiance sensor", "event_type": "sensor_drift", "site_id": None},
-    {"query": "turbine shaking more than usual", "event_type": "mechanical_wear", "site_id": None},
-    {"query": "gearbox bearing problems and rising vibration", "event_type": "mechanical_wear", "site_id": None},
-    {"query": "output falling while the nacelle vibrates", "event_type": "mechanical_wear", "site_id": None},
-    {"query": "has an inverter overheated here before?", "event_type": "inverter_fault", "site_id": "wind-03"},
-    {"query": "sensor problems at this site", "event_type": "sensor_drift", "site_id": "solar-03"},
-    {"query": "was there any grid curtailment?", "event_type": "curtailment", "site_id": "wind-03"},
+    {"query": "inverter shut itself down because it was running too hot", "event_type": "inverter_fault",
+     "site_id": None},
+    {"query": "power keeps cutting in and out, maybe a bad cable connection", "event_type": "inverter_fault",
+     "site_id": None},
+    {"query": "output limited even though the sun is strong", "event_type": "inverter_fault",
+     "site_id": None},
+    {"query": "failed power electronics module in the inverter", "event_type": "inverter_fault",
+     "site_id": None},
+    {"query": "grid operator asked us to reduce output", "event_type": "curtailment",
+     "site_id": None},
+    {"query": "we capped production because electricity prices were low", "event_type": "curtailment",
+     "site_id": None},
+    {"query": "low output was intentional, not a fault", "event_type": "curtailment",
+     "site_id": None},
+    {"query": "temperature reading is a few degrees off", "event_type": "sensor_drift",
+     "site_id": None},
+    {"query": "readings slowly wandering away from the true value", "event_type": "sensor_drift",
+     "site_id": None},
+    {"query": "pyranometer disagrees with our irradiance sensor", "event_type": "sensor_drift",
+     "site_id": None},
+    {"query": "turbine shaking more than usual", "event_type": "mechanical_wear",
+     "site_id": None},
+    {"query": "gearbox bearing problems and rising vibration", "event_type": "mechanical_wear",
+     "site_id": None},
+    {"query": "output falling while the nacelle vibrates", "event_type": "mechanical_wear",
+     "site_id": None},
+    {"query": "has an inverter overheated here before?", "event_type": "inverter_fault",
+     "site_id": "wind-03"},
+    {"query": "sensor problems at this site", "event_type": "sensor_drift",
+     "site_id": "solar-03"},
+    {"query": "was there any grid curtailment?", "event_type": "curtailment",
+     "site_id": "wind-03"},
 ]
 
 
@@ -86,7 +102,9 @@ def failures(store: VectorStore, mode: SearchMode = "hybrid") -> list[str]:
 
 def main() -> int:
     store = VectorStore.load()
-    print(f"embedder: {store.info['embedder']}  ({store.info['n_records']} logs, {len(GOLDEN_RETRIEVAL)} golden queries)\n")
+    info = store.info
+    print(f"embedder: {info['embedder']}  "
+          f"({info['n_records']} logs, {len(GOLDEN_RETRIEVAL)} golden queries)\n")
     print(f"{'mode':<8}{'hit@3':>8}{'P@3':>8}{'MRR':>8}")
     for mode in ("vector", "bm25", "hybrid"):
         m = evaluate(store, mode)

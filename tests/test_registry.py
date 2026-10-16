@@ -78,3 +78,16 @@ def test_first_version_becomes_champion() -> None:
     fake = _FakeRegistryClient({"1": 0.5}, champion=None)
     assert promote_if_not_worse(cast(MlflowClient, fake), "anomaly_detector", "1")
     assert fake.champion == "1"
+
+
+def test_anomaly_probabilities_are_calibrated(client: TestClient) -> None:
+    # Healthy rows used to average ~0.3 (class_weight="balanced"), so 0.4 read as
+    # alarming when nothing was wrong. Calibrated, they sit near the anomaly rate.
+    from app.main import get_state
+    from ml.features import ANOMALY_FEATURES
+
+    df = get_state().df
+    proba = get_state().registry.anomaly_detector.model.predict_proba(df[ANOMALY_FEATURES])[:, 1]
+    healthy = ((df["is_anomaly"] == 0) & (df["is_curtailed"] == 0)).to_numpy()
+    assert proba[healthy].mean() < 0.1
+    assert proba[~healthy & (df["is_anomaly"] == 1).to_numpy()].mean() > 0.3

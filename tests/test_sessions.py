@@ -51,7 +51,8 @@ def test_long_conversations_are_compacted_without_losing_events(client: TestClie
         ask(client, sid, q)
     context = client.get(f"/sessions/{sid}/context").json()
     assert [t["turn"] for t in context["turns"]] == [3, 4, 5][-RECENT_TURNS:]
-    assert "Turn 1: investigate wind-02" in context["summary"] and "Turn 2: and wind-03?" in context["summary"]
+    assert "Turn 1: investigate wind-02" in context["summary"]
+    assert "Turn 2: and wind-03?" in context["summary"]
     # compaction is itself an event; the original turns are all still in the log
     events = client.get(f"/sessions/{sid}/events").json()
     assert sum(e["type"] == "user_message" for e in events) == len(questions)
@@ -102,7 +103,8 @@ def test_a_restarted_process_continues_the_conversation(client: TestClient, tmp_
 
 
 def test_unknown_sessions_are_404(client: TestClient) -> None:
-    assert client.post("/sessions/nope/investigate", json={"question": "investigate wind-02"}).status_code == 404
+    response = client.post("/sessions/nope/investigate", json={"question": "investigate wind-02"})
+    assert response.status_code == 404
     assert client.get("/sessions/nope/events").status_code == 404
     assert client.post("/sessions/nope/resume").status_code == 404
 

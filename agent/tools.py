@@ -62,7 +62,9 @@ TOOL_SPECS: list[ToolParam] = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Describe the symptom in plain language, e.g. 'inverter tripped on overheating'",
+                    "description": (
+                        "Describe the symptom in plain language, e.g. 'inverter tripped on overheating'"
+                    ),
                 },
                 "k": {"type": "integer", "description": "Number of results", "default": 3},
                 "site_id": {
@@ -95,7 +97,8 @@ def _as_documents(hits: list[SearchHit]) -> list[dict[str, Any]]:
     return [
         Document(
             page_content=h["text"],
-            metadata={"site_id": h["site_id"], "event_type": h["event_type"], "date": h["date"], "score": h["score"]},
+            metadata={"site_id": h["site_id"], "event_type": h["event_type"], "date": h["date"],
+                      "score": h["score"]},
             id=h["log_id"],
         ).to_dict()
         for h in hits
@@ -105,12 +108,14 @@ def _as_documents(hits: list[SearchHit]) -> list[dict[str, Any]]:
 def dispatch(state: AppState, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
     """Run one tool inside its own trace span, recording the full input and output."""
     is_retrieval = tool_name == "search_maintenance_logs"
-    with mlflow.start_span(name=tool_name, span_type=SpanType.RETRIEVER if is_retrieval else SpanType.TOOL) as span:
+    span_type = SpanType.RETRIEVER if is_retrieval else SpanType.TOOL
+    with mlflow.start_span(name=tool_name, span_type=span_type) as span:
         span.set_inputs(tool_input)
         result = _run_tool(state, tool_name, tool_input)
         if is_retrieval and "results" in result:
             span.set_outputs(_as_documents(cast(list[SearchHit], result["results"])))
-            span.set_attributes({"retrieval.embedder": state.vector_store.info["embedder"], "retrieval.mode": "hybrid"})
+            span.set_attributes({"retrieval.embedder": state.vector_store.info["embedder"],
+                                 "retrieval.mode": "hybrid"})
         else:
             span.set_outputs(result)
         if "error" in result:

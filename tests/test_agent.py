@@ -40,7 +40,8 @@ def test_agent_explains_curtailment_instead_of_flagging_a_fault(client: TestClie
     row = df[df["is_curtailed"] == 1].iloc[0]
     from agent.tools import dispatch
 
-    result = dispatch(get_state(), "check_anomaly", {"site_id": str(row["site_id"]), "as_of": str(row["timestamp"])})
+    tool_input = {"site_id": str(row["site_id"]), "as_of": str(row["timestamp"])}
+    result = dispatch(get_state(), "check_anomaly", tool_input)
     assert result["is_curtailed"] is True
 
 
@@ -82,13 +83,16 @@ def test_agent_query_is_traced_end_to_end(client: TestClient) -> None:
 def test_citations_are_checked_against_what_was_retrieved() -> None:
     from agent.orchestrator import check_citations
 
-    tool_calls = [{"tool": "search_maintenance_logs", "input": {}, "output": {"results": [{"log_id": "log-0009"}]}}]
-    supported, unsupported = check_citations("Seen before [log-0009], also [log-0042]; see [log-0009].", tool_calls)
+    output = {"results": [{"log_id": "log-0009"}]}
+    tool_calls = [{"tool": "search_maintenance_logs", "input": {}, "output": output}]
+    answer = "Seen before [log-0009], also [log-0042]; see [log-0009]."
+    supported, unsupported = check_citations(answer, tool_calls)
     assert supported == ["log-0009"] and unsupported == ["log-0042"]
 
 
 def test_rule_based_answer_cites_the_logs_it_used(client: TestClient) -> None:
-    body = client.post("/agent/query", json={"question": "have we seen this vibration before on wind-3"}).json()
+    question = "have we seen this vibration before on wind-3"
+    body = client.post("/agent/query", json={"question": question}).json()
     search = next(c for c in body["tool_calls"] if c["tool"] == "search_maintenance_logs")
     assert search["input"]["site_id"] == "wind-03"
     retrieved = [h["log_id"] for h in search["output"]["results"]]
@@ -122,7 +126,8 @@ def test_llm_loop_formats_tool_results_and_checks_citations(
             # second turn: answer citing the first log it was shown, plus one it never saw
             tool_results.append(kwargs["messages"][-1]["content"][0]["content"])
             first_id = tool_results[0].split("[", 1)[1].split("]", 1)[0]
-            return SimpleNamespace(content=[TextBlock(type="text", text=f"Yes - see [{first_id}]. Also [log-9999].")])
+            text = f"Yes - see [{first_id}]. Also [log-9999]."
+            return SimpleNamespace(content=[TextBlock(type="text", text=text)])
 
     class FakeAnthropic:
         def __init__(self, api_key: str) -> None:

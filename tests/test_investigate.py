@@ -12,7 +12,8 @@ HEALTHY = {"site_id": "wind-02", "is_anomaly": False, "is_curtailed": False, "an
            "actual_power_kw": 450.42, "expected_power_kw": 405.78, "residual_pct": 0.11}
 ANOMALOUS = {**HEALTHY, "is_anomaly": True, "anomaly_probability": 0.9955, "residual_pct": -0.3415}
 CURTAILED = {**HEALTHY, "is_curtailed": True}
-LOGS = {"results": [{"log_id": "log-0021", "text": "2026-02-11 — Site wind-02: Vibration on turbine 4 for 9h."}]}
+LOGS = {"results": [{"log_id": "log-0021",
+                      "text": "2026-02-11 — Site wind-02: Vibration on turbine 4 for 9h."}]}
 
 
 def evidence(check: dict[str, Any], logs: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -65,12 +66,15 @@ def test_quoted_logs_do_not_count_as_status_claims() -> None:
     # Regression: with the bge embedder, solar-02's search returned a curtailment log ending in
     # "equipment healthy", and the verifier read that as the answer calling the site healthy.
     log = {"log_id": "log-0007", "text": "2026-03-01 — Site wind-02: Output cap applied; equipment healthy."}
-    curtailment_log = {"log_id": "log-0008", "text": "2026-03-02 — Site wind-02: Grid curtailment order for 2h."}
-    answer = f"wind-02 looks anomalous. Past incidents: [log-0007] {log['text']} [log-0008] {curtailment_log['text']}"
+    curtailment_log = {"log_id": "log-0008",
+                       "text": "2026-03-02 — Site wind-02: Grid curtailment order for 2h."}
+    answer = (f"wind-02 looks anomalous. Past incidents: [log-0007] {log['text']} "
+              f"[log-0008] {curtailment_log['text']}")
     logs = {"results": [log, curtailment_log]}
     assert check_status(answer, evidence(ANOMALOUS, logs)) == []
     # ...and a quoted curtailment log doesn't satisfy "mention today's curtailment" either
-    issues = check_status("wind-02 output is low. [log-0008] " + curtailment_log["text"], evidence(CURTAILED, logs))
+    answer = "wind-02 output is low. [log-0008] " + curtailment_log["text"]
+    issues = check_status(answer, evidence(CURTAILED, logs))
     assert [i["check"] for i in issues] == ["status"]
 
 
@@ -114,7 +118,8 @@ def test_plan_validation_drops_what_cannot_run(client: TestClient) -> None:
 def test_conditions_only_follow_anomalies_not_curtailment(client: TestClient) -> None:
     results = execute(app.main.get_state(), [
         {"tool": "check_anomaly", "input": {"site_id": "solar-01"}, "reason": "", "condition": "always"},
-        {"tool": "search_maintenance_logs", "input": {"query": "x"}, "reason": "", "condition": "anomalous:solar-01"},
+        {"tool": "search_maintenance_logs", "input": {"query": "x"}, "reason": "",
+         "condition": "anomalous:solar-01"},
     ])
     first = results[0]["output"]
     assert results[1]["skipped"] is not (first["is_anomaly"] and not first["is_curtailed"])
@@ -137,13 +142,16 @@ def test_investigation_is_one_trace_with_an_evaluator_span(client: TestClient) -
 # --- LLM pipeline, with Claude scripted ---------------------------------------
 
 
-def _scripted_claude(monkeypatch: pytest.MonkeyPatch, drafts: list[str], verdicts: list[list[str]]) -> list[dict[str, Any]]:
+def _scripted_claude(
+    monkeypatch: pytest.MonkeyPatch, drafts: list[str], verdicts: list[list[str]]
+) -> list[dict[str, Any]]:
     import anthropic
     from anthropic.types import TextBlock, ToolUseBlock
 
     calls: list[dict[str, Any]] = []
     plan = [
-        {"tool": "check_anomaly", "input": {"site_id": "wind-02"}, "reason": "health first", "condition": "always"},
+        {"tool": "check_anomaly", "input": {"site_id": "wind-02"}, "reason": "health first",
+         "condition": "always"},
         {"tool": "search_maintenance_logs", "input": {"query": "wind-02 faults", "site_id": "wind-02"},
          "reason": "precedents", "condition": "anomalous:wind-02"},
         {"tool": "restart_turbine", "input": {"site_id": "wind-02"}, "reason": "?", "condition": "always"},
@@ -154,7 +162,8 @@ def _scripted_claude(monkeypatch: pytest.MonkeyPatch, drafts: list[str], verdict
             calls.append(kwargs)
             forced = kwargs.get("tool_choice", {}).get("name")
             if forced == "submit_plan":
-                return SimpleNamespace(content=[ToolUseBlock(type="tool_use", id="p", name=forced, input={"steps": plan})])
+                block = ToolUseBlock(type="tool_use", id="p", name=forced, input={"steps": plan})
+                return SimpleNamespace(content=[block])
             if forced == "submit_verdict":
                 return SimpleNamespace(content=[ToolUseBlock(type="tool_use", id="v", name=forced,
                                                              input={"issues": verdicts.pop(0)})])
@@ -172,7 +181,8 @@ def _scripted_claude(monkeypatch: pytest.MonkeyPatch, drafts: list[str], verdict
 def test_llm_pipeline_rejects_an_invented_number_and_accepts_the_revision(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls = _scripted_claude(monkeypatch, drafts=["wind-02 looks healthy at 999.9 kW.", "wind-02 looks healthy."],
+    calls = _scripted_claude(monkeypatch,
+                             drafts=["wind-02 looks healthy at 999.9 kW.", "wind-02 looks healthy."],
                              verdicts=[[], []])
     body = investigate(app.main.get_state(), "investigate wind-02")
 

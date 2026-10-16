@@ -5,7 +5,8 @@ Re-evaluates the *currently registered* models on the frozen held-out
 window and checks four kinds of behaviour against a committed baseline
 (ml/regression_baseline.json):
 
-  - model quality   : anomaly precision/recall/F1, forecaster + expected-power MAE
+  - model quality   : anomaly precision/recall/F1 and calibration (Brier score),
+                      forecaster + expected-power MAE
   - serving latency : p50/p95 of the real predict_anomaly() path, cache bypassed
   - agent routing   : a golden set of questions -> the tools the agent should call
   - investigation   : share of golden investigations whose answer passes the
@@ -35,7 +36,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import f1_score, mean_absolute_error, precision_score, recall_score
+from sklearn.metrics import brier_score_loss, f1_score, mean_absolute_error, precision_score, recall_score
 
 from agent.orchestrator import extract_intents, extract_site_ids
 from app.inference import predict_anomaly
@@ -53,6 +54,7 @@ TOLERANCES: dict[str, float] = {
     "anomaly_f1": -0.02,           # may drop at most 0.02 absolute
     "anomaly_recall": -0.03,
     "anomaly_precision": -0.03,
+    "anomaly_brier": 0.10,          # may rise at most 10% relative: probabilities must stay calibrated
     "forecast_mae_kw": 0.05,        # may rise at most 5% relative
     "expected_power_mae_kw": 0.05,
     "latency_p95_ms": 0.50,         # may rise at most 50% relative (noisy on shared CI runners)
@@ -69,8 +71,10 @@ GOLDEN_AGENT_QUERIES: list[tuple[str, list[str], list[str]]] = [
     ("is anything wrong with wind-02?", ["wind-02"], ["check_anomaly"]),
     ("what's the forecast for solar-01 next hour", ["solar-01"], ["forecast_power"]),
     ("have we seen this vibration before on wind-3", ["wind-03"], ["search_maintenance_logs"]),
-    ("solar-02 output drop - any similar past incident?", ["solar-02"], ["check_anomaly", "search_maintenance_logs"]),
-    ("predict solar-03 and check if wind-01 has a fault", ["solar-03", "wind-01"], ["check_anomaly", "forecast_power"]),
+    ("solar-02 output drop - any similar past incident?", ["solar-02"],
+     ["check_anomaly", "search_maintenance_logs"]),
+    ("predict solar-03 and check if wind-01 has a fault", ["solar-03", "wind-01"],
+     ["check_anomaly", "forecast_power"]),
     ("how is solar-01 doing", ["solar-01"], ["check_anomaly"]),
 ]
 
@@ -95,11 +99,14 @@ def eval_quality(state: AppState) -> dict[str, float]:
     df = state.df
     _, test = time_split(df)
 
-    pred = state.registry.anomaly_detector.model.predict(test[ANOMALY_FEATURES])
+    detector = state.registry.anomaly_detector.model
+    pred = detector.predict(test[ANOMALY_FEATURES])
+    proba = detector.predict_proba(test[ANOMALY_FEATURES])[:, 1]
     y = test["is_anomaly"]
 
     healthy = test[(test.is_anomaly == 0) & (test.is_curtailed == 0)]
-    ep_pred = physical_expected_power(healthy, state.registry.expected_power.model.predict(healthy[EXPECTED_POWER_FEATURES]))
+    ep_raw = state.registry.expected_power.model.predict(healthy[EXPECTED_POWER_FEATURES])
+    ep_pred = physical_expected_power(healthy, ep_raw)
 
     fc = test.dropna(subset=FORECAST_FEATURES + ["target_power_kw"])
     fc_pred = state.registry.forecaster.model.predict(fc[FORECAST_FEATURES])
@@ -108,6 +115,7 @@ def eval_quality(state: AppState) -> dict[str, float]:
         "anomaly_precision": round(float(precision_score(y, pred)), 4),
         "anomaly_recall": round(float(recall_score(y, pred)), 4),
         "anomaly_f1": round(float(f1_score(y, pred)), 4),
+        "anomaly_brier": round(float(brier_score_loss(y, proba)), 4),
         "expected_power_mae_kw": round(float(mean_absolute_error(healthy["power_kw"], ep_pred)), 3),
         "forecast_mae_kw": round(float(mean_absolute_error(fc["target_power_kw"], fc_pred)), 3),
     }
@@ -160,13 +168,15 @@ def eval_investigations(state: AppState) -> dict[str, Any]:
     for question, when in GOLDEN_INVESTIGATIONS:
         as_of = None
         if when == "top_flagged":
-            moment = state.top_flagged_moment(extract_site_ids(question, [s["site_id"] for s in state.sites])[0])
+            site = extract_site_ids(question, [s["site_id"] for s in state.sites])[0]
+            moment = state.top_flagged_moment(site)
             as_of = moment["timestamp"] if moment else None
         result = investigate(state, question, as_of, allow_llm=False)  # deterministic, no API spend
         if result["verification"]["passed"]:
             verified += 1
         else:
-            failures.append({"question": question, "as_of": as_of, "issues": result["verification"]["issues"]})
+            issues = result["verification"]["issues"]
+            failures.append({"question": question, "as_of": as_of, "issues": issues})
     return {
         "investigation_verified_rate": round(verified / len(GOLDEN_INVESTIGATIONS), 4),
         "investigation_failures": failures,
@@ -187,7 +197,7 @@ def compare(current: dict[str, Any], baseline: dict[str, float]) -> list[str]:
             print(f"note: no baseline for {key} yet - run `make baseline` to start gating it")
             continue
         cur, base = current[key], baseline[key]
-        lower_is_better = key.endswith(("_kw", "_ms"))
+        lower_is_better = key.endswith(("_kw", "_ms", "_brier"))
         if lower_is_better:
             if cur > base * (1 + tol):
                 problems.append(f"{key}: {cur} vs baseline {base} (allowed +{tol:.0%})")

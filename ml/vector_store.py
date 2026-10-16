@@ -218,7 +218,8 @@ class VectorStore:
         store = cls(index, records, embedder)
         (STORE_DIR / "metadata.json").write_text(json.dumps(store.info, indent=2))
 
-        print(f"[vector_store] indexed {len(records)} maintenance logs via {embedder.name}, dim={vectors.shape[1]}")
+        print(f"[vector_store] indexed {len(records)} maintenance logs via {embedder.name}, "
+              f"dim={vectors.shape[1]}")
         return store
 
     @classmethod

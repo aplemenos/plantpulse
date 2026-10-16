@@ -24,6 +24,7 @@ class RandomForestClassifier(BaseEstimator):
         *,
         n_estimators: int = ...,
         max_depth: int | None = ...,
+        min_samples_leaf: int = ...,
         class_weight: Literal["balanced", "balanced_subsample"] | dict[int, float] | None = ...,
         random_state: int | None = ...,
         n_jobs: int | None = ...,

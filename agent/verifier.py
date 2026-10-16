@@ -33,7 +33,9 @@ _IGNORED_SPANS = re.compile(
 _NUMBER = re.compile(r"(?<![\w.])-?\d+(?:,\d{3})*(?:\.\d+)?")
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 _NEGATED_ANOMALY = re.compile(r"\b(?:no|not|isn't|is not|without|nothing)\b[^.]{0,30}anomal", re.IGNORECASE)
-_CLAIMS_HEALTHY = re.compile(r"\bhealthy\b|\boperating normally\b|\bno (?:sign of )?(?:issue|problem|anomal)", re.IGNORECASE)
+_CLAIMS_HEALTHY = re.compile(
+    r"\bhealthy\b|\boperating normally\b|\bno (?:sign of )?(?:issue|problem|anomal)", re.IGNORECASE
+)
 
 SMALL_COUNT = 10  # bare integers up to this are treated as counts ("2 incidents", "inverter 3")
 
@@ -80,7 +82,8 @@ def _evidence_numbers(obj: Any) -> list[float]:
 
 def _is_supported(value: float, decimals: int, pool: list[float]) -> bool:
     tolerance = 0.5 * 10 ** -decimals + 1e-9  # "450 kW" is supported by 450.42
-    candidates = (b for x in pool for b in (x, abs(x), x * 100, abs(x) * 100))  # 0.215 may be written as 21.5%
+    # 0.215 may be written as 21.5%
+    candidates = (b for x in pool for b in (x, abs(x), x * 100, abs(x) * 100))
     return any(abs(abs(value) - abs(c)) <= tolerance for c in candidates)
 
 
@@ -140,14 +143,17 @@ def check_status(answer: str, evidence: Evidence) -> list[Issue]:
             continue
         if result["is_curtailed"]:
             if "curtail" not in text.lower():
-                issues.append({"check": "status", "detail": f"{site_id} is curtailed, but the answer doesn't say so"})
+                detail = f"{site_id} is curtailed, but the answer doesn't say so"
+                issues.append({"check": "status", "detail": detail})
         elif result["is_anomaly"]:
             if _CLAIMS_HEALTHY.search(text):
-                issues.append({"check": "status", "detail": f"answer calls {site_id} healthy, but the model flagged it"})
+                detail = f"answer calls {site_id} healthy, but the model flagged it"
+                issues.append({"check": "status", "detail": detail})
         else:
             mentions = re.findall(r"anomal\w*", text, re.IGNORECASE)
             if mentions and not _NEGATED_ANOMALY.search(text):
-                issues.append({"check": "status", "detail": f"answer calls {site_id} anomalous, but the model says healthy"})
+                detail = f"answer calls {site_id} anomalous, but the model says healthy"
+                issues.append({"check": "status", "detail": detail})
     return issues
 
 
@@ -158,4 +164,5 @@ def verify(answer: str, evidence: Evidence) -> Verification:
         "status": check_status(answer, evidence),
     }
     issues = [issue for group in found.values() for issue in group]
-    return {"passed": not issues, "checks": {name: not group for name, group in found.items()}, "issues": issues}
+    checks = {name: not group for name, group in found.items()}
+    return {"passed": not issues, "checks": checks, "issues": issues}
