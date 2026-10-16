@@ -147,13 +147,13 @@ For Claude Desktop, add this to `claude_desktop_config.json`:
     "plantpulse": {
       "command": "/path/to/plantpulse/.venv/bin/python",
       "args": ["-m", "agent.mcp_server"],
-      "cwd": "/path/to/plantpulse"
+      "env": { "PYTHONPATH": "/path/to/plantpulse" }
     }
   }
 }
 ```
 
-or, for Claude Code: `claude mcp add plantpulse -- /path/to/plantpulse/.venv/bin/python -m agent.mcp_server`.
+(Claude Desktop ignores `cwd`, hence `PYTHONPATH`.) Or, for Claude Code: `claude mcp add plantpulse -- /path/to/plantpulse/.venv/bin/python -m agent.mcp_server`.
 
 The models load in the background when a client connects, so the handshake doesn't wait on them. A test launches the server as a subprocess and talks to it over stdio, so a stray `print` to stdout, which would corrupt the protocol, fails CI.
 
